@@ -1,5 +1,5 @@
-# Jio Recharge Bot — Playwright-based (browser automation)
-import telebot, re, time, os, sys, json, threading, random, datetime, subprocess
+# Jio Recharge Bot — Playwright-based (fully fixed)
+import telebot, re, time, os, sys, json, threading, random, datetime, subprocess, concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -10,7 +10,6 @@ except:
 
 # ================= PLAYWRIGHT BOOTSTRAP =================
 def _ensure_chromium():
-    """Verify Chromium exists; auto-install if missing."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -24,7 +23,7 @@ def _ensure_chromium():
             if path and Path(path).exists():
                 print(f"[BOOT] Chromium OK: {path}")
                 return
-            print(f"[BOOT] Chromium path returned but missing: {path}")
+            print(f"[BOOT] Chromium path missing: {path}")
     except Exception as e:
         print(f"[BOOT] Check failed: {e}")
 
@@ -37,14 +36,20 @@ def _ensure_chromium():
             print(f"[BOOT] install-deps skipped: {de}")
         with sync_playwright() as p:
             path = p.chromium.executable_path
-            print(f"[BOOT] Chromium path after install: {path}")
+            print(f"[BOOT] Chromium after install: {path}")
     except Exception as e:
         print(f"[BOOT] Install failed: {e}")
 
-_ensure_chromium()
+def _ensure_chromium_async():
+    def worker():
+        try: _ensure_chromium()
+        except Exception as e: print(f"[BOOT] Background failed: {e}")
+    threading.Thread(target=worker, daemon=True).start()
+
+_ensure_chromium_async()
 
 # ================= CONFIG =================
-BOT_TOKEN = '8854376849:AAEk1bQAx_KbzpWsRxdyilL6qILYRqxj4dc'
+BOT_TOKEN = '8970318644:AAGrG_g7UQUONWus5nj2xm5E3WoLtQr6GT4'
 ADMIN_ID = 8752143085
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -259,10 +264,15 @@ def status_head(status):
     return heads.get(status, "⚠️ <b>UNKNOWN</b>")
 
 
-def run_check(phone, amount, card, proxy_str=None):
+def run_check(phone, amount, card, proxy_str=None, timeout=240):
     proxy = proxy_dict(proxy_str) if proxy_str else None
     try:
-        st, dt, url, meta = jio_checkout(phone, amount, card, proxy=proxy, headless=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(jio_checkout, phone, amount, card, proxy=proxy, headless=True)
+            try:
+                st, dt, url, meta = future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                return "error", f"Timeout after {timeout}s. Browser too slow."
     except Exception as e:
         return "error", f"Check failed: {str(e)[:120]}"
 
@@ -328,18 +338,60 @@ def jio_single(message):
         bot.reply_to(message, "❌ <b>Invalid card format.</b>", parse_mode="HTML"); return
 
     msg = bot.reply_to(message,
-        f"⏳ <b>Processing Jio recharge (browser)...</b>\n"
+        f"⏳ <b>Step 1/5: Launching browser...</b>\n"
         f"👤 Phone: <code>{phone}</code>\n"
         f"💰 Amount: ₹{amount}\n"
-        f"💳 Card: <code>{card_label(card)}</code>\n"
-        f"⏱️ This takes 30–120s",
+        f"💳 Card: <code>{card_label(card)}</code>",
         parse_mode="HTML")
 
+    def update_step(step, text, elapsed):
+        try:
+            bot.edit_message_text(
+                f"⏳ <b>{step}:</b> {text}\n"
+                f"👤 Phone: <code>{phone}</code>\n"
+                f"💰 Amount: ₹{amount}\n"
+                f"💳 Card: <code>{card_label(card)}</code>\n"
+                f"⏱️ {elapsed}s",
+                message.chat.id, msg.message_id, parse_mode="HTML")
+        except: pass
+
     proxy = get_random_proxy()
-    try:
-        status, response = run_check(phone, amount, card, proxy_str=proxy)
-    except Exception as e:
-        status, response = "error", f"Failed: {e}"
+    holder = {"st": None, "resp": None}
+
+    def runner():
+        try:
+            st, resp = run_check(phone, amount, card, proxy_str=proxy)
+            holder["st"] = st
+            holder["resp"] = resp
+        except Exception as e:
+            holder["st"] = "error"
+            holder["resp"] = f"Failed: {e}"
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+
+    stages = [
+        (5,   "Step 1/5", "Launching browser"),
+        (15,  "Step 2/5", "Loading Jio page"),
+        (30,  "Step 3/5", "Fetching plans"),
+        (50,  "Step 4/5", "Filling card form"),
+        (80,  "Step 5/5", "Submitting payment"),
+        (120, "Step 5/5", "Awaiting bank response"),
+    ]
+    start_t = time.time()
+    shown = set()
+    while t.is_alive():
+        elapsed = int(time.time() - start_t)
+        for secs, step, text in stages:
+            if elapsed >= secs and secs not in shown:
+                shown.add(secs)
+                update_step(step, text, elapsed)
+                break
+        time.sleep(2)
+
+    t.join(timeout=5)
+    status = holder["st"] or "error"
+    response = holder["resp"] or "No response"
 
     if is_admin(uid): rk = " [ADMIN]"
     elif is_premium(uid): rk = " [PREMIUM]"
@@ -380,7 +432,7 @@ def mjio_mass(message):
 
     limit = ADMIN_LIMIT if is_admin(uid) else (PREMIUM_LIMIT if is_premium(uid) else FREE_LIMIT)
     if limit == 0:
-        bot.reply_to(message, "⚠️ <b>Free users cannot use mass check.</b>\nAsk admin for premium.", parse_mode="HTML"); return
+        bot.reply_to(message, "⚠️ <b>Free users cannot use mass check.</b>", parse_mode="HTML"); return
     if ACTIVE_USERS_MPP.get(uid):
         bot.reply_to(message, "⚠️ <b>Mass check already running.</b>", parse_mode="HTML"); return
 
