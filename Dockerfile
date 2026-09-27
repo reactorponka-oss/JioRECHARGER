@@ -1,15 +1,15 @@
-FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-ENV PYTHONUNBUFFERED=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libcurl4-openssl-dev curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-RUN python -m playwright install chromium && \
-    python -m playwright install-deps chromium || true
 
 COPY . .
 
