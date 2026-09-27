@@ -1,13 +1,6 @@
 __pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-env/
-.env
+*.pyc
+JioData/
 *.log
-.DS_Store
-.idea/
-.vscode/
-*.session
-*.session-journal
+.env
+venv/
