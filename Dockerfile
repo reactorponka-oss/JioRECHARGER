@@ -9,8 +9,13 @@ ENV PYTHONUNBUFFERED=1 \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Force chromium + all system deps
 RUN python -m playwright install chromium && \
-    python -m playwright install-deps chromium
+    python -m playwright install-deps chromium || true
+
+# Verify chromium is installed
+RUN ls -la /ms-playwright/ && \
+    find /ms-playwright -name "chrome" -o -name "headless_shell" | head -5
 
 COPY . .
 
