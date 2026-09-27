@@ -1,6 +1,6 @@
-# Jio Recharge Bot — Single-file, fully self-contained
-import telebot, re, time, os, sys, json, threading, random, datetime, subprocess, asyncio
-from concurrent.futures import ThreadPoolExecutor
+# Jio Recharge Bot — Single-file, fully self-contained, all bugs fixed
+import telebot, re, time, os, sys, json, threading, random, datetime, subprocess, asyncio, traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from pathlib import Path
 
 try:
@@ -12,7 +12,6 @@ except:
 # PLAYWRIGHT BOOTSTRAP
 # =====================================================================
 def _find_chromium():
-    """Find an existing Chromium binary on the system."""
     import shutil
     from glob import glob
     candidates = [
@@ -45,38 +44,27 @@ def _find_chromium():
 
 
 def _install_chromium():
-    """Install playwright chromium + system deps. Returns True on success."""
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "playwright"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "playwright"], timeout=300)
     except Exception as e:
-        print(f"[BOOT] pip playwright failed: {e}")
+        print(f"[BOOT] pip playwright failed: {str(e)[:120]}")
 
-    # install system deps first (needs root in docker)
     try:
-        subprocess.check_call(
-            [sys.executable, "-m", "playwright", "install-deps", "chromium"],
-            timeout=300
-        )
+        subprocess.check_call([sys.executable, "-m", "playwright", "install-deps", "chromium"], timeout=300)
         print("[BOOT] install-deps OK")
     except Exception as e:
         print(f"[BOOT] install-deps failed (non-fatal): {str(e)[:120]}")
 
-    # then install browser
     try:
-        subprocess.check_call(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            timeout=300
-        )
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"], timeout=300)
         print("[BOOT] chromium install OK")
+        return True
     except Exception as e:
         print(f"[BOOT] chromium install failed: {str(e)[:120]}")
         return False
 
-    return True
-
 
 def _ensure_chromium():
-    """Check chromium; install if missing."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -101,7 +89,6 @@ def _ensure_chromium():
     print("[BOOT] Installing Chromium...")
     _install_chromium()
 
-    # recheck
     try:
         with sync_playwright() as p:
             path = p.chromium.executable_path
@@ -123,7 +110,7 @@ _ensure_chromium_async()
 
 
 # =====================================================================
-# JIO CHECKOUT (inlined from jio.py)
+# JIO CORE (inlined)
 # =====================================================================
 def _jio_dbg(msg):
     print(f"[jio] {msg}", flush=True)
@@ -146,8 +133,6 @@ def _page_text(page):
 
 
 def _launch_browser(pw, launch_kwargs):
-    """Launch chromium with full fallback."""
-    # try default first
     try:
         return pw.chromium.launch(**launch_kwargs)
     except Exception as e:
@@ -159,7 +144,6 @@ def _launch_browser(pw, launch_kwargs):
             raise
         print(f"[jio] Default launch failed, trying fallback...")
 
-    # try alternate path
     found = _find_chromium()
     if found:
         print(f"[jio] Trying alternate: {found}")
@@ -169,7 +153,6 @@ def _launch_browser(pw, launch_kwargs):
         except Exception as e2:
             print(f"[jio] Alternate failed: {str(e2)[:120]}")
 
-    # last resort: install
     print("[jio] Installing Chromium as last resort...")
     _install_chromium()
     launch_kwargs.pop("executable_path", None)
@@ -742,19 +725,37 @@ def classify(st, dt):
 
 
 def run_check(phone, amount, card, proxy_str=None, timeout=240):
+    """Always returns (status, message) — 2-tuple guaranteed."""
     proxy = proxy_dict(proxy_str) if proxy_str else None
     try:
         with ThreadPoolExecutor(max_workers=1) as ex:
             future = ex.submit(jio_checkout, phone, amount, card, proxy=proxy, headless=True)
             try:
-                st, dt, url, meta = future.result(timeout=timeout)
+                res = future.result(timeout=timeout)
+            except FuturesTimeout:
+                return "error", f"Timeout after {timeout}s"
             except Exception as te:
                 if "timeout" in str(te).lower():
-                    return "error", f"Timeout after {timeout}s", None
+                    return "error", f"Timeout after {timeout}s"
                 raise
     except Exception as e:
-        return "error", f"Check failed: {str(e)[:120]}", None
-    return classify(st, dt)
+        return "error", f"Check failed: {str(e)[:120]}"
+
+    # res should be a 4-tuple (status, message, url, meta)
+    try:
+        if isinstance(res, tuple) and len(res) >= 2:
+            st = res[0]
+            dt = res[1]
+        else:
+            return "error", f"Unexpected result type: {type(res).__name__}"
+    except Exception as e:
+        return "error", f"Result parse failed: {str(e)[:120]}"
+
+    try:
+        st, dt = classify(st, dt)
+    except Exception as e:
+        return "error", f"Classify failed: {str(e)[:120]}"
+    return st, dt
 
 
 # =====================================================================
@@ -881,7 +882,7 @@ def jio_single(message):
 
     def runner():
         try:
-            st, resp, _ = run_check(phone, amount, card, proxy_str=proxy)
+            st, resp = run_check(phone, amount, card, proxy_str=proxy)
             holder["st"] = st
             holder["resp"] = resp
         except Exception as e:
@@ -1023,7 +1024,7 @@ def mjio_mass(message):
         if not ACTIVE_JOBS.get(job_id): return
         proxy = get_random_proxy()
         try:
-            status, response, _ = run_check(phone, amount, card, proxy_str=proxy)
+            status, response = run_check(phone, amount, card, proxy_str=proxy)
         except Exception as e:
             status, response = "error", f"Failed: {str(e)[:120]}"
         entry = f"{card_label(card)} - {response}"
