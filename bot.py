@@ -1,11 +1,47 @@
 # Jio Recharge Bot — Playwright-based (browser automation)
-import telebot, re, time, os, sys, json, threading, random, datetime
+import telebot, re, time, os, sys, json, threading, random, datetime, subprocess
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 try:
     sys.stdout.reconfigure(encoding='utf-8')
 except:
     pass
+
+# ================= PLAYWRIGHT BOOTSTRAP =================
+def _ensure_chromium():
+    """Verify Chromium exists; auto-install if missing."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("[BOOT] pip install playwright...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
+        from playwright.sync_api import sync_playwright
+
+    try:
+        with sync_playwright() as p:
+            path = p.chromium.executable_path
+            if path and Path(path).exists():
+                print(f"[BOOT] Chromium OK: {path}")
+                return
+            print(f"[BOOT] Chromium path returned but missing: {path}")
+    except Exception as e:
+        print(f"[BOOT] Check failed: {e}")
+
+    print("[BOOT] Installing Chromium...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+        try:
+            subprocess.check_call([sys.executable, "-m", "playwright", "install-deps", "chromium"])
+        except Exception as de:
+            print(f"[BOOT] install-deps skipped: {de}")
+        with sync_playwright() as p:
+            path = p.chromium.executable_path
+            print(f"[BOOT] Chromium path after install: {path}")
+    except Exception as e:
+        print(f"[BOOT] Install failed: {e}")
+
+_ensure_chromium()
 
 # ================= CONFIG =================
 BOT_TOKEN = '8854376849:AAEk1bQAx_KbzpWsRxdyilL6qILYRqxj4dc'
@@ -135,6 +171,67 @@ def proxy_dict(entry):
         return None
 
 load_proxies()
+
+# ================= PROXY COMMANDS =================
+@bot.message_handler(commands=['proxy'])
+def proxy_command(message):
+    uid = message.from_user.id
+    if is_banned(uid):
+        bot.reply_to(message, "❌ <b>You are banned.</b>", parse_mode="HTML"); return
+    add_user(uid)
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "📝 <b>Use:</b> /proxy add/list/remove", parse_mode="HTML"); return
+    cmd = parts[1].split()[0].lower()
+    arg = parts[1][len(cmd):].strip()
+
+    if cmd == 'add':
+        add_list = []
+        if arg: add_list = [l.strip() for l in arg.splitlines() if l.strip()]
+        elif message.reply_to_message:
+            raw = message.reply_to_message.text or message.reply_to_message.caption or ''
+            add_list = [l.strip() for l in raw.splitlines() if l.strip()]
+        if not add_list:
+            bot.reply_to(message, "📝 /proxy add host:port:user:pass", parse_mode="HTML"); return
+        existing = []
+        if os.path.exists(PROXY_FILE):
+            with open(PROXY_FILE, 'r') as f: existing = [l.strip() for l in f if l.strip()]
+        eset = set(existing)
+        new = [p for p in add_list if p not in eset]
+        save_proxies(existing + new)
+        bot.reply_to(message,
+            f"📊 <b>Proxy Add Result</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"┣ 📦 Total ➜ {len(add_list)}\n"
+            f"┣ ✅ Added ➜ {len(new)}\n"
+            f"┗ 🔄 Duplicate ➜ {len(add_list)-len(new)}",
+            parse_mode="HTML")
+
+    elif cmd == 'remove':
+        if not arg: bot.reply_to(message, "📝 /proxy remove index/all", parse_mode="HTML"); return
+        if not os.path.exists(PROXY_FILE): bot.reply_to(message, "❌ No proxies", parse_mode="HTML"); return
+        with open(PROXY_FILE, 'r') as f: proxies = [l.strip() for l in f if l.strip()]
+        if arg == 'all':
+            save_proxies([]); bot.reply_to(message, "✅ <b>All proxies removed</b>", parse_mode="HTML"); return
+        try:
+            idx = int(arg)
+            if idx < 1 or idx > len(proxies):
+                bot.reply_to(message, f"❌ Invalid. Total: {len(proxies)}", parse_mode="HTML"); return
+            removed = proxies.pop(idx-1); save_proxies(proxies)
+            bot.reply_to(message, f"✅ Removed ➜ {removed}\n📦 Remaining ➜ {len(proxies)}", parse_mode="HTML")
+        except: bot.reply_to(message, "📝 /proxy remove index/all", parse_mode="HTML")
+
+    elif cmd == 'list':
+        if not proxy_list: bot.reply_to(message, "❌ No proxies", parse_mode="HTML"); return
+        lines = [f"📋 <b>Proxies ({len(proxy_list)})</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        for i, p in enumerate(proxy_list, 1):
+            masked = p[:30]+'...' if len(p) > 33 else p
+            lines.append(f"┣ {i}. {masked}")
+        if len(proxy_list) > 50:
+            lines = lines[:50] + [f"┗ ... and {len(proxy_list)-50} more"]
+        else: lines[-1] = lines[-1].replace('┣', '┗')
+        bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
+    else:
+        bot.reply_to(message, "❌ <b>Unknown command</b>", parse_mode="HTML")
 
 # ================= JIO CORE =================
 from jio import (
