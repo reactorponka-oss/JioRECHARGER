@@ -1,4 +1,4 @@
-# Jio Recharge Bot — Single-file, fully self-contained, all bugs fixed
+# Jio Recharge Bot — Single-file, fully fixed (v3)
 import telebot, re, time, os, sys, json, threading, random, datetime, subprocess, asyncio, traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from pathlib import Path
@@ -9,8 +9,11 @@ except:
     pass
 
 # =====================================================================
-# PLAYWRIGHT BOOTSTRAP
+# CHROMIUM — verify once, install only if missing
 # =====================================================================
+_CHROMIUM_READY = threading.Event()
+_CHROMIUM_PATH = {"path": None}
+
 def _find_chromium():
     import shutil
     from glob import glob
@@ -43,70 +46,84 @@ def _find_chromium():
     return None
 
 
-def _install_chromium():
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "playwright"], timeout=300)
-    except Exception as e:
-        print(f"[BOOT] pip playwright failed: {str(e)[:120]}")
+def _verify_chromium_once():
+    """Check once. If exists, mark ready. If missing, install in background."""
+    print("[BOOT] Verifying Chromium...")
 
-    try:
-        subprocess.check_call([sys.executable, "-m", "playwright", "install-deps", "chromium"], timeout=300)
-        print("[BOOT] install-deps OK")
-    except Exception as e:
-        print(f"[BOOT] install-deps failed (non-fatal): {str(e)[:120]}")
+    # fast path — check filesystem first (skip playwright import)
+    found = _find_chromium()
+    if found:
+        _CHROMIUM_PATH["path"] = found
+        _CHROMIUM_READY.set()
+        print(f"[BOOT] Chromium found on disk: {found}")
+        return
 
-    try:
-        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"], timeout=300)
-        print("[BOOT] chromium install OK")
-        return True
-    except Exception as e:
-        print(f"[BOOT] chromium install failed: {str(e)[:120]}")
-        return False
-
-
-def _ensure_chromium():
+    # slower — ask playwright
     try:
         from playwright.sync_api import sync_playwright
-    except ImportError:
-        print("[BOOT] playwright not installed, installing...")
-        _install_chromium()
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            print("[BOOT] playwright STILL not installed")
-            return
-
-    try:
         with sync_playwright() as p:
             path = p.chromium.executable_path
             if path and Path(path).exists():
-                print(f"[BOOT] Chromium OK: {path}")
+                _CHROMIUM_PATH["path"] = path
+                _CHROMIUM_READY.set()
+                print(f"[BOOT] Chromium OK (playwright): {path}")
                 return
-            print(f"[BOOT] Chromium path missing: {path}")
+            print(f"[BOOT] Playwright path missing: {path}")
+    except ImportError:
+        print("[BOOT] playwright not installed yet")
     except Exception as e:
         print(f"[BOOT] Playwright check failed: {str(e)[:120]}")
 
-    print("[BOOT] Installing Chromium...")
-    _install_chromium()
+    # install once, in background
+    def installer():
+        try:
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "--quiet", "playwright"],
+                    timeout=300)
+            except Exception as e:
+                print(f"[BOOT] pip playwright failed: {str(e)[:120]}")
 
-    try:
-        with sync_playwright() as p:
-            path = p.chromium.executable_path
-            if path and Path(path).exists():
-                print(f"[BOOT] Chromium OK after install: {path}")
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+                    timeout=300)
+                print("[BOOT] install-deps OK")
+            except Exception as e:
+                print(f"[BOOT] install-deps failed (non-fatal): {str(e)[:120]}")
+
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "playwright", "install", "chromium"],
+                    timeout=300)
+                print("[BOOT] chromium install OK")
+            except Exception as e:
+                print(f"[BOOT] chromium install failed: {str(e)[:120]}")
+                return
+
+            found = _find_chromium()
+            if found:
+                _CHROMIUM_PATH["path"] = found
+                _CHROMIUM_READY.set()
+                print(f"[BOOT] Chromium now ready: {found}")
             else:
-                print(f"[BOOT] Chromium STILL missing: {path}")
-    except Exception as e:
-        print(f"[BOOT] Recheck failed: {str(e)[:120]}")
+                try:
+                    from playwright.sync_api import sync_playwright
+                    with sync_playwright() as p:
+                        path = p.chromium.executable_path
+                        if path and Path(path).exists():
+                            _CHROMIUM_PATH["path"] = path
+                            _CHROMIUM_READY.set()
+                            print(f"[BOOT] Chromium ready: {path}")
+                except Exception as e:
+                    print(f"[BOOT] Post-install check failed: {e}")
+        except Exception as e:
+            print(f"[BOOT] Installer crashed: {e}")
+
+    threading.Thread(target=installer, daemon=True).start()
 
 
-def _ensure_chromium_async():
-    def worker():
-        try: _ensure_chromium()
-        except Exception as e: print(f"[BOOT] Background install failed: {e}")
-    threading.Thread(target=worker, daemon=True).start()
-
-_ensure_chromium_async()
+threading.Thread(target=_verify_chromium_once, daemon=True).start()
 
 
 # =====================================================================
@@ -133,28 +150,45 @@ def _page_text(page):
 
 
 def _launch_browser(pw, launch_kwargs):
+    """Try launch; use cached path; last-resort install."""
+    # 1. try default
     try:
         return pw.chromium.launch(**launch_kwargs)
     except Exception as e:
         err = str(e).lower()
-        if ("executable doesn't exist" not in err
-                and "executable not found" not in err
-                and "please run the following command" not in err
-                and "host system is missing" not in err):
+        if not any(k in err for k in [
+            "executable doesn't exist", "executable not found",
+            "please run the following command", "host system is missing"
+        ]):
             raise
-        print(f"[jio] Default launch failed, trying fallback...")
+        print(f"[jio] Default launch failed, trying alternate...")
 
-    found = _find_chromium()
-    if found:
-        print(f"[jio] Trying alternate: {found}")
-        launch_kwargs["executable_path"] = found
+    # 2. try cached path
+    cached = _CHROMIUM_PATH.get("path")
+    if cached and Path(cached).exists():
+        print(f"[jio] Trying cached path: {cached}")
+        launch_kwargs["executable_path"] = cached
         try:
             return pw.chromium.launch(**launch_kwargs)
         except Exception as e2:
-            print(f"[jio] Alternate failed: {str(e2)[:120]}")
+            print(f"[jio] Cached path failed: {str(e2)[:120]}")
 
-    print("[jio] Installing Chromium as last resort...")
-    _install_chromium()
+    # 3. try finding again
+    found = _find_chromium()
+    if found:
+        print(f"[jio] Trying found: {found}")
+        launch_kwargs["executable_path"] = found
+        try:
+            return pw.chromium.launch(**launch_kwargs)
+        except Exception as e3:
+            print(f"[jio] Found path failed: {str(e3)[:120]}")
+
+    # 4. install as last resort (should rarely happen now)
+    print("[jio] Last resort: installing Chromium...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"], timeout=300)
+    except Exception as e:
+        print(f"[jio] Install failed: {str(e)[:120]}")
     launch_kwargs.pop("executable_path", None)
     return pw.chromium.launch(**launch_kwargs)
 
@@ -559,7 +593,7 @@ PROXY_FILE = 'JioData/proxies.txt'
 ADMIN_LIMIT = 50
 PREMIUM_LIMIT = 15
 FREE_LIMIT = 0
-WORKERS = 3
+WORKERS = 2   # reduced to prevent overload
 
 ACTIVE_JOBS = {}
 ACTIVE_USERS_MPP = {}
@@ -741,15 +775,14 @@ def run_check(phone, amount, card, proxy_str=None, timeout=240):
     except Exception as e:
         return "error", f"Check failed: {str(e)[:120]}"
 
-    # res should be a 4-tuple (status, message, url, meta)
     try:
         if isinstance(res, tuple) and len(res) >= 2:
             st = res[0]
             dt = res[1]
         else:
-            return "error", f"Unexpected result type: {type(res).__name__}"
+            return "error", f"Unexpected result type"
     except Exception as e:
-        return "error", f"Result parse failed: {str(e)[:120]}"
+        return "error", f"Parse failed: {str(e)[:120]}"
 
     try:
         st, dt = classify(st, dt)
@@ -830,17 +863,25 @@ def start(message):
     if is_banned(uid):
         bot.reply_to(message, "❌ <b>You are banned.</b>", parse_mode="HTML"); return
     add_user(uid)
+    ready = "✅ Ready" if _CHROMIUM_READY.is_set() else "⏳ Installing Chromium..."
     bot.reply_to(message,
         f"👋 <b>Welcome to Jio Recharge Bot</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 User ➤ <b>{message.from_user.first_name}</b>\n"
         f"🆔 ID ➤ <code>{uid}</code>\n"
+        f"🔧 Browser ➤ {ready}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⚡ /jio — Single check\n"
         f"📦 /mjio — Mass check\n"
         f"🌐 /proxy — Manage proxies\n"
         f"👤 /info — Account info",
         parse_mode="HTML")
+
+def _wait_for_chromium(timeout=180):
+    """Block until chromium ready or timeout."""
+    if _CHROMIUM_READY.is_set():
+        return True
+    return _CHROMIUM_READY.wait(timeout=timeout)
 
 @bot.message_handler(commands=['jio'])
 def jio_single(message):
@@ -858,6 +899,19 @@ def jio_single(message):
     card = parse_card_line(cc)
     if not card:
         bot.reply_to(message, "❌ <b>Invalid card format.</b>", parse_mode="HTML"); return
+
+    if not _CHROMIUM_READY.is_set():
+        msg = bot.reply_to(message,
+            f"⏳ <b>Chromium not ready. Waiting up to 3 min...</b>\n"
+            f"(This only happens once after fresh deploy)",
+            parse_mode="HTML")
+        if not _wait_for_chromium(timeout=180):
+            try: bot.delete_message(message.chat.id, msg.message_id)
+            except: pass
+            bot.reply_to(message, "❌ <b>Chromium still not ready. Try again in 1 minute.</b>", parse_mode="HTML")
+            return
+        try: bot.delete_message(message.chat.id, msg.message_id)
+        except: pass
 
     msg = bot.reply_to(message,
         f"⏳ <b>Step 1/5: Launching browser...</b>\n"
@@ -985,6 +1039,19 @@ def mjio_mass(message):
             "OR reply .txt with: <code>/mjio &lt;phone&gt; &lt;amount&gt;</code>",
             parse_mode="HTML"); return
 
+    # wait for chromium
+    if not _CHROMIUM_READY.is_set():
+        msg = bot.reply_to(message,
+            f"⏳ <b>Chromium not ready. Waiting up to 3 min...</b>",
+            parse_mode="HTML")
+        if not _wait_for_chromium(timeout=180):
+            try: bot.delete_message(message.chat.id, msg.message_id)
+            except: pass
+            bot.reply_to(message, "❌ <b>Chromium not ready. Try again.</b>", parse_mode="HTML")
+            return
+        try: bot.delete_message(message.chat.id, msg.message_id)
+        except: pass
+
     job_id = f"{int(time.time())}{random.randint(100,999)}"
     ACTIVE_JOBS[job_id] = True
     ACTIVE_USERS_MPP[uid] = True
@@ -1026,7 +1093,9 @@ def mjio_mass(message):
         try:
             status, response = run_check(phone, amount, card, proxy_str=proxy)
         except Exception as e:
-            status, response = "error", f"Failed: {str(e)[:120]}"
+            tb = traceback.format_exc()
+            print(f"[mjio] worker exception:\n{tb}")
+            status, response = "error", f"Worker failed: {str(e)[:120]}"
         entry = f"{card_label(card)} - {response}"
 
         if status == "success":
@@ -1074,41 +1143,58 @@ def mjio_mass(message):
                                        parse_mode="HTML", reply_markup=mkup())
             except: pass
 
-    try:
-        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            for c in cards:
-                if not ACTIVE_JOBS.get(job_id): break
-                ex.submit(worker, c)
-        ACTIVE_JOBS.pop(job_id, None)
-        ACTIVE_USERS_MPP[uid] = False
-        try: bot.edit_message_text(cap(done=True), message.chat.id, prog.message_id,
-                                   parse_mode="HTML", reply_markup=mkup(done=True))
-        except: pass
-
-        lines = []
-        for sec, lbl in [("hits_list","HITS"),("3ds_list","3DS"),
-                         ("insufficient_list","INSUFFICIENT FUNDS"),
-                         ("declined_list","DECLINED"),("error_list","ERRORS")]:
-            if results.get(sec):
-                lines.append(f"{lbl}:"); lines.extend(results[sec]); lines.append("")
-        if lines:
-            content = "\n".join(lines)
-            fcap = (f"📊 <b>Results</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-                    f"┣ ✅ Hits ➜ {results['hits']}\n"
-                    f"┣ 🔥 3DS ➜ {results['3ds']}\n"
-                    f"┣ 💸 Insufficient ➜ {results['insufficient']}\n"
-                    f"┣ ❌ Declined ➜ {results['declined']}\n"
-                    f"┣ ⚠️ Errors ➜ {results['error']}\n"
-                    f"┗ 📦 Total ➜ {results['checked']}")
-            path = "JioResults.txt"
-            with open(path, "w", encoding="utf-8") as f: f.write(content)
-            with open(path, "rb") as f:
-                bot.send_document(message.chat.id, f, caption=fcap, parse_mode="HTML")
-            try: os.remove(path)
+    def runner_all():
+        try:
+            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                futures = []
+                for c in cards:
+                    if not ACTIVE_JOBS.get(job_id): break
+                    futures.append(ex.submit(worker, c))
+                for f in futures:
+                    try: f.result()
+                    except Exception as fe:
+                        print(f"[mjio] future exception: {fe}")
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"[mjio] runner exception:\n{tb}")
+        finally:
+            ACTIVE_JOBS.pop(job_id, None)
+            ACTIVE_USERS_MPP[uid] = False
+            try:
+                bot.edit_message_text(cap(done=True), message.chat.id, prog.message_id,
+                                      parse_mode="HTML", reply_markup=mkup(done=True))
             except: pass
-    except Exception as e:
-        ACTIVE_JOBS.pop(job_id, None)
-        ACTIVE_USERS_MPP[uid] = False
+
+            # send results file
+            try:
+                lines = []
+                for sec, lbl in [("hits_list","HITS"),("3ds_list","3DS"),
+                                 ("insufficient_list","INSUFFICIENT FUNDS"),
+                                 ("declined_list","DECLINED"),("error_list","ERRORS")]:
+                    if results.get(sec):
+                        lines.append(f"{lbl}:"); lines.extend(results[sec]); lines.append("")
+                if lines:
+                    content = "\n".join(lines)
+                    fcap = (f"📊 <b>Results</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                            f"┣ ✅ Hits ➜ {results['hits']}\n"
+                            f"┣ 🔥 3DS ➜ {results['3ds']}\n"
+                            f"┣ 💸 Insufficient ➜ {results['insufficient']}\n"
+                            f"┣ ❌ Declined ➜ {results['declined']}\n"
+                            f"┣ ⚠️ Errors ➜ {results['error']}\n"
+                            f"┗ 📦 Total ➜ {results['checked']}")
+                    path = "JioResults.txt"
+                    with open(path, "w", encoding="utf-8") as f: f.write(content)
+                    with open(path, "rb") as f:
+                        bot.send_document(message.chat.id, f, caption=fcap, parse_mode="HTML")
+                    try: os.remove(path)
+                    except: pass
+                else:
+                    bot.send_message(message.chat.id, "📊 <b>No results to report.</b>", parse_mode="HTML")
+            except Exception as e:
+                print(f"[mjio] results send failed: {e}")
+
+    # Start mass check in background thread so bot stays responsive
+    threading.Thread(target=runner_all, daemon=True).start()
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("stop_"))
 def cb_stop(call):
