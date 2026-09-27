@@ -1,6 +1,0 @@
-__pycache__/
-*.pyc
-JioData/
-*.log
-.env
-venv/
