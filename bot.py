@@ -1,4 +1,4 @@
-# Jio Recharge Bot — v5 (timeout-killer build)
+# Jio Recharge Bot — v7 (thread-safe, no pool, stable)
 import telebot, re, time, os, sys, json, threading, random, datetime, subprocess, traceback, gc
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from pathlib import Path
@@ -50,7 +50,6 @@ status_head = styled_result_head
 # =====================================================================
 _CHROMIUM_READY = threading.Event()
 _CHROMIUM_PATH = {"path": None}
-_CHROMIUM_LOCK = threading.Lock()
 
 def _find_chromium():
     import shutil
@@ -127,87 +126,11 @@ def _kill_zombie_browsers():
 
 def _zombie_cleanup_loop():
     while True:
-        time.sleep(600)  # 10 min
+        time.sleep(600)
         _kill_zombie_browsers()
         gc.collect()
 
 threading.Thread(target=_zombie_cleanup_loop, daemon=True).start()
-
-# =====================================================================
-# BROWSER POOL — one browser, many pages (memory efficient)
-# =====================================================================
-class BrowserPool:
-    """Singleton browser reuse across checks. Kills timeout issues."""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._playwright = None
-        self._browser = None
-        self._ctx = None
-
-    def _start(self):
-        """Start playwright + browser if not running."""
-        from playwright.sync_api import sync_playwright
-        if self._playwright is None:
-            self._playwright = sync_playwright().start()
-        if self._browser is None or not self._browser.is_connected():
-            exe = _CHROMIUM_PATH.get("path") or _find_chromium()
-            launch_kwargs = {
-                "headless": True,
-                "args": [
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-software-rasterizer",
-                    "--disable-extensions",
-                    "--disable-background-networking",
-                    "--disable-sync",
-                    "--disable-translate",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-setuid-sandbox",
-                    "--disable-accelerated-2d-canvas",
-                    "--disable-accelerated-video-decode",
-                    "--disable-features=TranslateUI,BlinkGenPropertyTrees,IsolateOrigins,site-per-process",
-                    "--memory-pressure-off",
-                ],
-                "timeout": 90000,  # 90s max (from start)
-            }
-            if exe and Path(exe).exists():
-                launch_kwargs["executable_path"] = exe
-            try:
-                self._browser = self._playwright.chromium.launch(**launch_kwargs)
-                print("[POOL] Browser launched")
-            except Exception as e:
-                # fallback — try install
-                print(f"[POOL] Launch failed: {str(e)[:120]}")
-                try: subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"], timeout=300)
-                except: pass
-                launch_kwargs.pop("executable_path", None)
-                self._browser = self._playwright.chromium.launch(**launch_kwargs)
-                print("[POOL] Browser launched (after install)")
-
-    def get_context(self):
-        """Return a fresh isolated context (cookies/cache clean)."""
-        with self._lock:
-            self._start()
-            ctx = self._browser.new_context(
-                viewport={"width": 1366, "height": 768},
-                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0.0.0 Safari/537.36"),
-            )
-            return ctx
-
-    def reset(self):
-        """Force close and restart browser."""
-        with self._lock:
-            try:
-                if self._browser: self._browser.close()
-            except: pass
-            self._browser = None
-
-_pool = BrowserPool()
 
 # =====================================================================
 # JIO CORE
@@ -261,23 +184,61 @@ def card_label(card):
 
 
 def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
-    """Uses browser pool. Returns (status, message, url, meta)."""
+    """Each call creates its own browser (thread-safe). Returns (status, message, url, meta)."""
+    from playwright.sync_api import sync_playwright
     if deadline is None: deadline = time.time() + 180
     meta = {"merchant":"Jio Recharge","amount":amount,"plan":""}
 
-    ctx = None
-    try:
-        ctx = _pool.get_context()
-    except Exception as e:
-        # pool failed — try reset + retry once
-        print(f"[jio] Pool context failed: {str(e)[:120]}")
-        _pool.reset()
-        try:
-            ctx = _pool.get_context()
-        except Exception as e2:
-            return "error", f"Browser pool failed: {str(e2)[:120]}", "", meta
+    p = sync_playwright()
+    pw = p.start()
+    launch_kwargs = {
+        "headless": headless,
+        "args": [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-translate",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-setuid-sandbox",
+            "--disable-accelerated-2d-canvas",
+            "--disable-accelerated-video-decode",
+            "--disable-features=TranslateUI,BlinkGenPropertyTrees,IsolateOrigins,site-per-process",
+            "--memory-pressure-off",
+        ],
+        "timeout": 90000,
+    }
+    if proxy:
+        launch_kwargs["proxy"] = proxy
 
-    page = ctx.new_page()
+    exe = _CHROMIUM_PATH.get("path") or _find_chromium()
+    if exe and Path(exe).exists():
+        launch_kwargs["executable_path"] = exe
+
+    try:
+        browser = pw.chromium.launch(**launch_kwargs)
+    except Exception as e:
+        err = str(e).lower()
+        if "executable doesn't exist" in err or "please run" in err or "host system" in err:
+            try: subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"], timeout=300)
+            except: pass
+            launch_kwargs.pop("executable_path", None)
+            try:
+                browser = pw.chromium.launch(**launch_kwargs)
+            except Exception as e2:
+                try: pw.stop()
+                except: pass
+                return "error", f"Browser launch failed: {str(e2)[:150]}", "", meta
+        else:
+            try: pw.stop()
+            except: pass
+            return "error", f"Browser launch failed: {str(e)[:150]}", "", meta
+
+    page = browser.new_page()
     try:
         page.goto("https://www.jio.com/selfcare/recharge/mobility",
                   wait_until="domcontentloaded", timeout=45000)
@@ -528,7 +489,9 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
     finally:
         try: page.close()
         except: pass
-        try: ctx.close()
+        try: browser.close()
+        except: pass
+        try: pw.stop()
         except: pass
 
 # =====================================================================
@@ -684,13 +647,9 @@ def run_one_check(phone, amount, card, proxy_str=None, timeout=180):
             try:
                 res = future.result(timeout=timeout)
             except FuturesTimeout:
-                # reset pool on timeout
-                _pool.reset()
                 return "error", f"Timeout"
             except Exception as te:
-                if "timeout" in str(te).lower():
-                    _pool.reset()
-                    return "error", f"Timeout"
+                if "timeout" in str(te).lower(): return "error", f"Timeout"
                 raise
     except Exception as e:
         return "error", f"Failed: {str(e)[:120]}"
@@ -810,8 +769,8 @@ def jio_single(message):
         bot.reply_to(message, f"{E['cross']} <b>Invalid card format.</b>", parse_mode="HTML"); return
 
     if not _CHROMIUM_READY.is_set():
-        wait_msg = bot.reply_to(message, f"{E['clock']} <b>Chromium not ready. Waiting (max 3 min)...</b>", parse_mode="HTML")
-        if not _CHROMIUM_READY.wait(timeout=180):
+        wait_msg = bot.reply_to(message, f"{E['clock']} <b>Chromium warming up (max 90s)...</b>", parse_mode="HTML")
+        if not _CHROMIUM_READY.wait(timeout=90):
             try: bot.delete_message(message.chat.id, wait_msg.message_id)
             except: pass
             bot.reply_to(message, f"{E['cross']} <b>Chromium not ready. Try again.</b>", parse_mode="HTML")
@@ -934,8 +893,8 @@ def mjio_mass(message):
             parse_mode="HTML"); return
 
     if not _CHROMIUM_READY.is_set():
-        wait_msg = bot.reply_to(message, f"{E['clock']} <b>Chromium not ready. Waiting (max 3 min)...</b>", parse_mode="HTML")
-        if not _CHROMIUM_READY.wait(timeout=180):
+        wait_msg = bot.reply_to(message, f"{E['clock']} <b>Chromium warming up (max 90s)...</b>", parse_mode="HTML")
+        if not _CHROMIUM_READY.wait(timeout=90):
             try: bot.delete_message(message.chat.id, wait_msg.message_id)
             except: pass
             bot.reply_to(message, f"{E['cross']} <b>Chromium not ready. Try again.</b>", parse_mode="HTML")
@@ -1199,10 +1158,9 @@ def bot_stats(message):
 # MAIN
 # =====================================================================
 if __name__ == "__main__":
-    print("JIO BOT v5 IS RUNNING...\n")
+    print("JIO BOT v7 IS RUNNING...\n")
     _kill_zombie_browsers()
     print("[BOOT] Zombie browsers cleared")
-    print("[BOOT] Browser pool will start on first check\n")
     while True:
         try:
             bot.polling(non_stop=True, timeout=60)
