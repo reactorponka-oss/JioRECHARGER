@@ -1,4 +1,4 @@
-# Jio Recharge Bot — v7 (thread-safe, no pool, stable)
+# Jio Recharge Bot — v8 (secure token, thread-safe, stable)
 import telebot, re, time, os, sys, json, threading, random, datetime, subprocess, traceback, gc
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from pathlib import Path
@@ -7,6 +7,16 @@ try:
     sys.stdout.reconfigure(encoding='utf-8')
 except:
     pass
+
+# =====================================================================
+# TOKEN — env variable preferred, fallback to hardcoded
+# =====================================================================
+BOT_TOKEN = os.getenv('BOT_TOKEN', '8970318644:AAHgo5FCRQ8b0rUD5bdgx-8OSqAwLTcxqP0')
+ADMIN_ID = int(os.getenv('ADMIN_ID', '8752143085'))
+
+if not BOT_TOKEN or ':' not in BOT_TOKEN:
+    print("ERROR: BOT_TOKEN not set properly!")
+    sys.exit(1)
 
 # =====================================================================
 # THEME
@@ -184,7 +194,7 @@ def card_label(card):
 
 
 def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
-    """Each call creates its own browser (thread-safe). Returns (status, message, url, meta)."""
+    """Each call = its own browser (thread-safe). Returns (status, message, url, meta)."""
     from playwright.sync_api import sync_playwright
     if deadline is None: deadline = time.time() + 180
     meta = {"merchant":"Jio Recharge","amount":amount,"plan":""}
@@ -495,10 +505,8 @@ def jio_checkout(phone, amount, card, deadline=None, proxy=None, headless=True):
         except: pass
 
 # =====================================================================
-# BOT CONFIG
+# BOT
 # =====================================================================
-BOT_TOKEN = '8970318644:AAGrG_g7UQUONWus5nj2xm5E3WoLtQr6GT4'
-ADMIN_ID = 8752143085
 bot = telebot.TeleBot(BOT_TOKEN)
 
 os.makedirs('JioData', exist_ok=True)
@@ -653,14 +661,11 @@ def run_one_check(phone, amount, card, proxy_str=None, timeout=180):
                 raise
     except Exception as e:
         return "error", f"Failed: {str(e)[:120]}"
-
     try:
         if isinstance(res, tuple) and len(res) >= 2:
             st, dt = res[0], res[1]
-        else:
-            return "error", "Bad result"
+        else: return "error", "Bad result"
     except: return "error", "Parse failed"
-
     try: return classify(st, dt)
     except: return "error", "Classify failed"
 
@@ -1158,7 +1163,9 @@ def bot_stats(message):
 # MAIN
 # =====================================================================
 if __name__ == "__main__":
-    print("JIO BOT v7 IS RUNNING...\n")
+    print("JIO BOT v8 IS RUNNING...")
+    print(f"[BOOT] Token: {BOT_TOKEN[:15]}...{BOT_TOKEN[-5:]}")
+    print(f"[BOOT] Admin ID: {ADMIN_ID}")
     _kill_zombie_browsers()
     print("[BOOT] Zombie browsers cleared")
     while True:
